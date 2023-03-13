@@ -3,7 +3,8 @@ import math
 import mmap
 from typing import Dict, NamedTuple, List
 from enum import Enum
-from collections import OrderedDict
+from django.http import HttpResponse
+import fast_fisher.fast_fisher_cython
 
 from django.shortcuts import render
 from readiness.settings import BASE_DIR
@@ -62,9 +63,8 @@ def has_regression(records: List[TestRecord], conclusions: ConclusionMap) -> boo
     """
     for record in records:
         conclusion = conclusions.get(record.test_id, None)
-        if conclusion:
-            if conclusion.SIGNIFICANT_REGRESSION:
-                return True
+        if conclusion == Conclusion.SIGNIFICANT_REGRESSION:
+            return True
     return False
 
 
@@ -72,8 +72,8 @@ class CapabilityRecords(NamedTuple):
     name: CapabilityName
     test_records: Dict[TestId, TestRecord]
 
-    def has_regressed(self) -> bool:
-        return has_regression(self.test_records.values())
+    def has_regressed(self, conclusions) -> bool:
+        return has_regression(self.test_records.values(), conclusions=conclusions)
 
     def register_test_record(self, test_record: TestRecord):
         self.test_records[test_record.test_id] = test_record
@@ -95,8 +95,8 @@ class ComponentRecords(NamedTuple):
 
     def register_test_record_capability(self, capability_name: CapabilityName, test_record: TestRecord):
         if capability_name not in self.capabilities:
-            self.capabilities[capability_name] = CapabilityRecords(capability_name, list())
-        self.capabilities[capability_name].test_records.append(test_record)
+            self.capabilities[capability_name] = CapabilityRecords(capability_name, dict())
+        self.capabilities[capability_name].test_records[test_record.test_id] = test_record
 
 
 ById = Dict[TestId, TestRecord]
@@ -133,7 +133,7 @@ def categorize(rows) -> (ById, ByComponent):
                 by_component[label] = ComponentRecords(name=label, test_records=dict(), capabilities=dict())
             by_component[label].register_test_record(r)
 
-            capability = r.test_id[:3]
+            capability = r.test_id[:1]
             by_component[label].register_test_record_capability(capability, r)
 
     return by_id, by_component
@@ -143,7 +143,7 @@ def calculate_conclusions(basis_by_id: ById, samples_by_id: ById) -> ConclusionM
     by_conclusion: ConclusionMap = dict()
     for test_id, sample_result in samples_by_id.items():
         basis_result = basis_by_id.get(test_id, None)
-        if not basis_result:
+        if not basis_result or basis_result.total_count == 0:
             by_conclusion[test_id] = Conclusion.MISSING_IN_BASIS
             continue
 
@@ -173,6 +173,10 @@ def report(request):
     sample_start_dt = request.GET['sample_start_dt']
     sample_end_dt = request.GET['sample_end_dt']
 
+    target_component_name = request.GET.get('component', None)
+    target_capability_name = request.GET.get('capability', None)
+    target_test_id = request.GET.get('test_id', None)
+
     bq = bigquery.Client()
     q = f'''
         SELECT test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count 
@@ -195,9 +199,9 @@ def report(request):
     samples_by_id, samples_by_component = categorize(sample_rows)
 
     conclusions_by_id = calculate_conclusions(basis_by_id=basis_by_id, samples_by_id=samples_by_id)
-    component_summary: Dict[ComponentName, bool] = dict()
-    for component_name in sorted(list(samples_by_component.keys())):
-        component_summary[component_name] = samples_by_component[component_name].has_regressed(conclusions_by_id)
+
+    if target_component_name and target_component_name not in samples_by_component:
+        return HttpResponse(f'Component not found: {target_component_name}')
 
     context = {
         'basis_release': basis_release,
@@ -206,7 +210,50 @@ def report(request):
         'sample_release': sample_release,
         'sample_start_dt': sample_start_dt,
         'sample_end_dt': sample_end_dt,
-        'summary': component_summary,
     }
 
-    return render(request, 'main/report-component.html', context)
+    if target_test_id:
+        if target_test_id not in samples_by_id:
+            return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
+
+        sample_test_record = samples_by_id[target_test_id]
+        basis_test_record = basis_by_id.get(target_test_id, TestRecord(test_name='', total_count=0, success_count=0, failure_count=0, test_id=target_test_id))
+        context['sample_test'] = sample_test_record
+        context['basis_test'] = basis_test_record
+        context['fishers_exact'] = str(fast_fisher.fast_fisher_cython.fisher_exact(
+            sample_test_record.failure_count, sample_test_record.success_count,
+            basis_test_record.failure_count, basis_test_record.success_count,
+            alternative='greater'
+        ))
+
+        return render(request, 'main/report-test.html', context)
+
+    if not target_component_name:
+        component_summary: Dict[ComponentName, bool] = dict()
+        for component_name in sorted(list(samples_by_component.keys())):
+            component_summary[component_name] = samples_by_component[component_name].has_regressed(conclusions_by_id)
+
+        context['summary'] = component_summary
+        return render(request, 'main/report-components.html', context)
+    else:
+        context['component'] = target_component_name
+        if not target_capability_name:
+            capability_summary: Dict[CapabilityName, bool] = dict()
+            component_records = samples_by_component[target_component_name]
+            for capability_name in sorted(component_records.capabilities.keys()):
+                capability_summary[capability_name] = component_records.capabilities[capability_name].has_regressed(conclusions_by_id)
+
+            context['summary'] = capability_summary
+            return render(request, 'main/report-capabilities.html', context)
+        else:
+            test_summary: Dict[CapabilityName, (TestId, bool)] = dict()
+            context['capability'] = target_capability_name
+            component_records = samples_by_component[target_component_name]
+            if target_capability_name not in component_records.capabilities:
+                return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
+            capability_records = component_records.capabilities[target_capability_name]
+            for tr in sorted(list(capability_records.test_records.values()), key=lambda x: x.test_name):
+                test_summary[tr.test_name] = (tr.test_id, has_regression([tr], conclusions_by_id))
+
+            context['summary'] = test_summary
+            return render(request, 'main/report-tests.html', context)

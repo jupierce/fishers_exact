@@ -15,20 +15,17 @@
 
 <body>
 Sample Release {{sample_release}} vs Basis Release {{basis_release}}
+<br>
+Test Name: {{sample_test.test_name}}
+<br>
+Sample Successes: {{sample_test.success_count}} <br>
+Sample Failures: {{sample_test.failure_count}} <br>
+<br> <br>
+Basis Successes: {{basis_test.success_count}} <br>
+Basis Failures: {{basis_test.failure_count}} <br>
 
-
-
-<ul>
-{% for component_name, regressed in summary.items %}
-    <li><a href="/main/report?sample_release={{sample_release}}&basis_release={{basis_release}}&sample_start_dt={{sample_start_dt}}&sample_end_dt={{sample_end_dt}}&basis_start_dt={{basis_start_dt}}&basis_end_dt{{basis_end_dt}}">{{component_name}}</a>
-            {% if regressed  %}
-                <span class="ui-icon ui-icon-alert"></span>
-            {% else %}
-                <span class="ui-icon ui-icon-check"></span>
-            {% endif %}
-        </li>
-{% endfor %}
-</ul>
+<br> <br>
+Fisher's Exact: {{fishers_exact}}
 
 </body>
 

@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+{% load static %}
+
+<html>
+
+<head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Component Readiness Report</title>
+        <script src="{% static 'main/jquery/jquery.min.js' %}"></script>
+        <link rel="stylesheet" href="{% static 'main/jquery-ui/jquery-ui.structure.min.css' %}">
+        <link rel="stylesheet" href="{% static 'main/jquery-ui/jquery-ui.theme.min.css' %}">
+        <script src="{% static 'main/jquery-ui/jquery-ui.min.js' %}"></script>
+</head>
+
+<body>
+Sample Release {{sample_release}} vs Basis Release {{basis_release}}
+
+
+
+<ul>
+{% for test_name, outcome in summary.items %}
+    <li><a href="/main/report?sample_release={{sample_release}}&basis_release={{basis_release}}&sample_start_dt={{sample_start_dt}}&sample_end_dt={{sample_end_dt}}&basis_start_dt={{basis_start_dt}}&basis_end_dt={{basis_end_dt}}&test_id={{outcome.0}}">{{test_name}}</a>
+            {% if outcome.1  %}
+                <span class="ui-icon ui-icon-alert"></span>
+            {% else %}
+                <span class="ui-icon ui-icon-check"></span>
+            {% endif %}
+        </li>
+{% endfor %}
+</ul>
+
+</body>
+
+</html>
+

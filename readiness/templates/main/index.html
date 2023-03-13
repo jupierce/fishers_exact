@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+{% load static %}
+<html>
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Component Readiness Report</title>
+        <script src="{% static 'main/jquery/jquery.min.js' %}"></script>
+        <link rel="stylesheet" href="{% static 'main/jquery-ui/jquery-ui.structure.min.css' %}">
+        <link rel="stylesheet" href="{% static 'main/jquery-ui/jquery-ui.theme.min.css' %}">
+        <script src="{% static 'main/jquery-ui/jquery-ui.min.js' %}"></script>
+
+        <!--https://github.com/xdan/datetimepicker/tree/master/build-->
+        <script src="{% static 'main/jquery-datetimepicker/jquery.datetimepicker.js' %}"></script>
+        <link rel="stylesheet" href="{% static 'main/jquery-datetimepicker/jquery.datetimepicker.css' %}">
+        <script>
+
+            //  This function communicates with django (backend)
+
+            function date_to_dt(d) {
+                var components =  d.toISOString().split('T');
+                var hours = components[1].split(':')[0]
+                return components[0] + " " + hours + ":00";
+            }
+
+            function showReport() {
+                var basis_release = $("#basis_release").val();
+                var basis_start_dt = $("#basis_start_dt").val();
+                var basis_end_dt = $("#basis_end_dt").val();
+
+                var sample_release = $("#sample_release").val();
+                var sample_start_dt = $("#sample_start_dt").val();
+                var sample_end_dt = $("#sample_end_dt").val();
+
+                if (!basis_start_dt || !basis_end_dt || !sample_start_dt || !sample_end_dt) {
+                    return;
+                }
+                document.querySelector('#content').innerHTML = "Updating report...";
+
+                fetch('/main/report?sample_release=' + sample_release + '&basis_release=' + basis_release + '&sample_start_dt=' + sample_start_dt + '&sample_end_dt=' + sample_end_dt + '&basis_start_dt=' + basis_start_dt + '&basis_end_dt=' + basis_end_dt)
+                .then(response => response.text())
+                .then(text => {
+                    document.querySelector('#content').innerHTML = text;
+                });
+
+            }
+
+            /*
+            document.addEventListener("DOMContentLoaded", function() {
+                document.querySelectorAll('button').forEach(button => {
+                    button.onclick = function() {
+                        showSection(this.dataset.section)
+                    }
+                })
+            }); */
+
+            $( function() {
+                $( ".basis_control_group" ).controlgroup();
+                $( ".sample_control_group" ).controlgroup();
+
+                $('.dtp').datetimepicker({
+                  format:'Y-m-d H:i',
+                  onChangeDateTime:function(dp,$input){
+                    showReport();
+                  }
+                });
+
+
+                var now = new Date();
+                var last48 = new Date(now - (48 * 60 * 60 * 1000));
+                var last5d = new Date(now - (5 * 24 * 60 * 60 * 1000));
+
+                $("#basis_start_dt").val(date_to_dt(last5d));
+                $("#basis_end_dt").val(date_to_dt(last48));
+                $("#sample_start_dt").val(date_to_dt(last48));
+                $("#sample_end_dt").val(date_to_dt(now));
+                showReport();
+            } );
+
+        </script>
+    </head>
+    <body>
+
+        <fieldset style="display:inline-block;">
+            <legend>Historical Comparison Basis</legend>
+            <div class="basis_control_group">
+                <label for="basis_release">Release</label>
+                <select name="basis_release" id="basis_release">
+                    <option>4.10</option>
+                    <option>4.11</option>
+                    <option>4.12</option>
+                    <option>4.13</option>
+                    <option selected="selected">4.14</option>
+                </select>
+                <br>
+                <br>
+
+                <div>Date Range:</div>
+                <input class="dtp" id="basis_start_dt" type="text" >
+                <input class="dtp" id="basis_end_dt" type="text" >
+            </div>
+        </fieldset>
+
+        <fieldset style="display:inline-block;">
+            <legend>Test Sample</legend>
+            <div class="sample_control_group">
+                <label for="sample_release">Release</label>
+                <select name="sample_release" id="sample_release">
+                    <option>4.10</option>
+                    <option>4.11</option>
+                    <option>4.12</option>
+                    <option>4.13</option>
+                    <option selected="selected">4.14</option>
+                </select>
+                <br>
+                <br>
+
+                <div>Date Range:</div>
+                <input class="dtp" id="sample_start_dt" type="text" >
+                <input class="dtp" id="sample_end_dt" type="text" >
+            </div>
+        </fieldset>
+        <br>
+
+        <!-- Contents loaded from server is inserted here by javascript -->
+        <div id="content">
+
+        </div>
+
+    </body>
+</html>

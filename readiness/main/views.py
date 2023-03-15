@@ -1,7 +1,7 @@
 import re
 import math
 import mmap
-from typing import Dict, NamedTuple, List
+from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable
 from enum import Enum
 
 from django.utils.html import format_html
@@ -15,6 +15,8 @@ from readiness.settings import BASE_DIR
 
 from google.cloud import bigquery
 
+
+Nurp = str
 TestId = str
 ComponentName = str
 CapabilityName = str
@@ -33,6 +35,7 @@ table_mmap = mmap.mmap(table_bin.fileno(), length=0, access=mmap.ACCESS_READ)
 
 
 def fisher_offset(a, b, c, d) -> int:
+    # TODO: use chi^2 instead of normalizing to 500 samples?
     if a > 500 or b > 500:
         reducer = min((500 / max(a, 1)), (500 / max(b, 1)))  # use max in case one of the values is 0
         a = int(a * reducer)
@@ -47,7 +50,8 @@ def fisher_offset(a, b, c, d) -> int:
 def fisher_significant(a, b, c, d) -> bool:
     offset = fisher_offset(a, b, c, d)
     bin_offset = offset // 8
-    return table_mmap[bin_offset] & (1 << (offset % 8)) > 0
+    bit_shift = 7 - (offset % 8)
+    return table_mmap[bin_offset] & (1 << bit_shift) > 0
 
 
 class TestRecord(NamedTuple):
@@ -64,10 +68,10 @@ class Conclusion(Enum):
     SIGNIFICANT_REGRESSION = 3
 
 
-ConclusionMap = Dict[TestId, Conclusion]
+ConclusionMap = Dict[Nurp, Dict[TestId, Conclusion]]
 
 
-def has_regression(records: List[TestRecord], conclusions: ConclusionMap) -> bool:
+def has_regression(records: Iterable[TestRecord], conclusions: Dict[TestId, Conclusion]) -> bool:
     """
     :param records: The records to analyze
     :param conclusions: The conclusions for all tests analyzed
@@ -84,7 +88,7 @@ class CapabilityRecords(NamedTuple):
     name: CapabilityName
     test_records: Dict[TestId, TestRecord]
 
-    def has_regressed(self, conclusions) -> bool:
+    def has_regressed(self, conclusions: Dict[TestId, Conclusion]) -> bool:
         return has_regression(self.test_records.values(), conclusions=conclusions)
 
     def register_test_record(self, test_record: TestRecord):
@@ -99,7 +103,7 @@ class ComponentRecords(NamedTuple):
     test_records: Dict[TestId, TestRecord]
     capabilities: ByCapability
 
-    def has_regressed(self, conclusions) -> bool:
+    def has_regressed(self, conclusions: Dict[TestId, Conclusion]) -> bool:
         return has_regression(self.test_records.values(), conclusions=conclusions)
 
     def register_test_record(self, test_record: TestRecord):
@@ -122,11 +126,21 @@ def index(request):
 component_pattern = re.compile(r'\[[^\\]+?\]')
 
 
-def categorize(rows) -> (ById, ByComponent):
-    by_id: ById = dict()
-    by_component: ByComponent = dict()
+def categorize(rows) -> Dict[Nurp, Tuple[ById, ByComponent]]:
+    nurps: Dict[Nurp, Tuple[ById, ByComponent]] = dict()
 
     for row in rows:
+        nurp_name = row['nurp']
+        if nurp_name is None:
+            nurp_name = 'Unknown'
+
+        if nurp_name not in nurps:
+            by_id: ById = dict()
+            by_component: ByComponent = dict()
+            nurps[nurp_name] = (by_id, by_component)
+        else:
+            by_id, by_component = nurps[nurp_name]
+
         if row['success_count'] is None:
             # Not sure why, but bigquery can return None for some SUMs.
             # Potentially because success_val was not set on all original rows
@@ -148,40 +162,78 @@ def categorize(rows) -> (ById, ByComponent):
             capability = r.test_id[:1]
             by_component[label].register_test_record_capability(capability, r)
 
-    return by_id, by_component
+    return nurps
 
 
-def calculate_conclusions(basis_by_id: ById, samples_by_id: ById) -> ConclusionMap:
-    by_conclusion: ConclusionMap = dict()
-    for test_id, sample_result in samples_by_id.items():
-        basis_result = basis_by_id.get(test_id, None)
-        if not basis_result or basis_result.total_count == 0:
-            by_conclusion[test_id] = Conclusion.MISSING_IN_BASIS
-            continue
+def calculate_conclusions(basis_nurps: Dict[Nurp, Tuple[ById, ByComponent]], sample_nurps: Dict[Nurp, Tuple[ById, ByComponent]]) -> ConclusionMap:
+    conclusions_map: ConclusionMap = dict()
+    for nurp_name in sample_nurps:
+        basis_by_id, _ = basis_nurps.get(nurp_name, (dict(), dict()))
+        samples_by_id, _ = sample_nurps[nurp_name]
+        by_conclusion: Dict[TestId, Conclusion] = dict()
+        conclusions_map[nurp_name] = by_conclusion
 
-        basis_pass_percentage = basis_result.success_count / basis_result.total_count
-        sample_pass_percentage = sample_result.success_count / sample_result.total_count
-        improved = sample_pass_percentage >= basis_pass_percentage
+        for test_id, sample_result in samples_by_id.items():
+            basis_result = basis_by_id.get(test_id, None)
+            if not basis_result or basis_result.total_count == 0:
+                by_conclusion[test_id] = Conclusion.MISSING_IN_BASIS
+                continue
 
-        significant = fisher_significant(
-            sample_result.failure_count,
-            sample_result.success_count,
-            basis_result.failure_count,
-            basis_result.success_count,
-        )
+            basis_pass_percentage = basis_result.success_count / basis_result.total_count
+            sample_pass_percentage = sample_result.success_count / sample_result.total_count
+            improved = sample_pass_percentage >= basis_pass_percentage
 
-        if significant:
-            by_conclusion[test_id] = Conclusion.SIGNIFICANT_IMPROVEMENT if improved else Conclusion.SIGNIFICANT_REGRESSION
+            significant = fisher_significant(
+                sample_result.failure_count,
+                sample_result.success_count,
+                basis_result.failure_count,
+                basis_result.success_count,
+            )
 
-    return by_conclusion
+            if significant:
+                by_conclusion[test_id] = Conclusion.SIGNIFICANT_IMPROVEMENT if improved else Conclusion.SIGNIFICANT_REGRESSION
+
+    return conclusions_map
+
+
+class ImageColumnLink(NamedTuple):
+    image_path: str
+    height: Optional[int] = None
+    width: Optional[int] = None
+    href: Optional[str] = None
+    href_params: Optional[Dict[str, str]] = None
+
+
+class ImageColumn(tables.Column):
+
+    def render(self, value: ImageColumnLink):
+        image_path = value.image_path
+
+        height_attr = ''
+        if value.height:
+            height_attr = f'height="{value.height}" '
+
+        width_attr = ''
+        if value.width:
+            width_attr = f'width="{value.height}" '
+
+        content = f'<img {height_attr}{width_attr} src="/static/{image_path}"></img>'
+        if value.href:
+            content = f'<a href="{value.href}?{dict_to_params_url(value.href_params)}">{content}</a>'
+        return format_html(content)
+
+
+def dict_to_params_url(params):
+    if not params:
+        return ''
+    return '&'.join([f'{key}={value}' for key, value in params.items()])
 
 
 class AllComponentsTable(tables.Table):
     name = tables.Column()
-    regression = tables.Column()
 
-    def __init__(self, data, new_key, params):
-        super().__init__(data)
+    def __init__(self, data, extra_columns, new_key=None, params=None):
+        super().__init__(data, extra_columns=extra_columns)
         self.params = params
         self.new_key = new_key
 
@@ -189,8 +241,18 @@ class AllComponentsTable(tables.Table):
         attrs = {"class": "paleblue"}
 
     def render_name(self, value):
-        params_str = '&'.join([f'{key}={value}' for key, value in self.params.items()])
-        return format_html(f'<a href="/main/report?{params_str}&{self.new_key}={value}">{value}</a>')
+        if self.params is None:
+            params = dict()
+        else:
+            params = dict(self.params)
+        if self.new_key:
+            params[self.new_key] = value
+
+        if self.params:
+            params_str = dict_to_params_url(self.params)
+            return format_html(f'<a href="/main/report?{params_str}">{value}</a>')
+        else:
+            return value
 
 
 def report(request):
@@ -205,32 +267,34 @@ def report(request):
     target_component_name = request.GET.get('component', None)
     target_capability_name = request.GET.get('capability', None)
     target_test_id = request.GET.get('test_id', None)
+    target_nurp_name = request.GET.get('nurp', None)
+
+    target_nurp_filter = ''
+    if target_nurp_name:
+        target_nurp_filter = f'AND CONCAT(network, " ", upgrade, " ", arch, " ", platform) = "{target_nurp_name}" '
 
     bq = bigquery.Client()
     q = f'''
-        SELECT test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count 
+        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count 
         FROM `openshift-gce-devel.ci_analysis_us.junit` 
-        WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") 
-              AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY test_id        
+        WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter}
+              AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
     '''
 
     basis_rows = bq.query(q)
-    basis_by_id, basis_by_component = categorize(basis_rows)
+    basis_nurps = categorize(basis_rows)
 
     q = f'''
-        SELECT test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count
+        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count
         FROM `openshift-gce-devel.ci_analysis_us.junit` 
-        WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") 
-              AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY test_id        
+        WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter}
+              AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
     '''
 
     sample_rows = bq.query(q)
-    samples_by_id, samples_by_component = categorize(sample_rows)
+    sample_nurps = categorize(sample_rows)
 
-    conclusions_by_id = calculate_conclusions(basis_by_id=basis_by_id, samples_by_id=samples_by_id)
-
-    if target_component_name and target_component_name not in samples_by_component:
-        return HttpResponse(f'Component not found: {target_component_name}')
+    conclusions_by_nurp = calculate_conclusions(basis_nurps=basis_nurps, sample_nurps=sample_nurps)
 
     context = {
         'basis_release': basis_release,
@@ -242,8 +306,14 @@ def report(request):
     }
 
     if target_test_id:  # Rendering a specifically requested test id
+        if not target_nurp_name:
+            return HttpResponse(f'No nurp parameter was specified')
+
+        samples_by_id, samples_by_component = sample_nurps[target_nurp_name]
+        basis_by_id, _ = basis_nurps[target_nurp_name]
+
         if target_test_id not in samples_by_id:
-            return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
+            return HttpResponse(f'Target test {target_test_id} not found in nurp: {target_nurp_name}')
 
         sample_test_record = samples_by_id[target_test_id]
         basis_test_record = basis_by_id.get(target_test_id, TestRecord(test_name='', total_count=0, success_count=0, failure_count=0, test_id=target_test_id))
@@ -255,41 +325,113 @@ def report(request):
             alternative='greater'
         ))
 
+        context['breadcrumb'] = f'{target_nurp_name} > {target_component_name} > {target_capability_name} > {sample_test_record.test_name}'
         return render(request, 'main/report-test.html', context)
 
     if not target_component_name:  # Rendering all components
         component_summary: List[Dict] = list()
-        for component_name in sorted(list(samples_by_component.keys())):
-            component_summary.append(
-                {
-                    'name': component_name,
-                    'regression': samples_by_component[component_name].has_regressed(conclusions_by_id)
-                }
-            )
+        extra_columns = []
+        all_component_names = set()
+
+        for nurp_name in conclusions_by_nurp:
+            image_href_params = dict(context)
+            image_href_params['nurp'] = nurp_name
+            extra_columns.append((nurp_name, ImageColumn()))
+            _, by_component = sample_nurps[nurp_name]
+            all_component_names.update(by_component.keys())
+
+        for component_name in sorted(list(all_component_names)):
+            if 'sig' not in component_name:
+                continue
+
+            row = {
+                'name': component_name,
+            }
+
+            for nurp_name in sorted(sample_nurps):
+                _, samples_by_component = sample_nurps[nurp_name]
+                if component_name in samples_by_component:
+                    regressed = samples_by_component[component_name].has_regressed(conclusions_by_nurp[nurp_name])
+                else:
+                    regressed = False
+
+                href_params = dict(context)
+                href_params['component'] = component_name
+                href_params['nurp'] = nurp_name
+
+                row[nurp_name] = ImageColumnLink(
+                    image_path='/main/red.png' if regressed else '/main/green.png',
+                    height=16, width=16,
+                    href='/main/report',
+                    href_params=dict(href_params)
+                )
+
+            component_summary.append(row)
+
         table = AllComponentsTable(component_summary,
+                                   extra_columns=extra_columns,
                                    new_key='component',
-                                   params=context)
+                                   params=dict(context))
         context['table'] = table
+        context['breadcrumb'] = f'All Components'
         return render(request, 'main/report-table.html', context)
     else:  # Rendering all of a specific component's capabilities
+        if not target_nurp_name:
+            return HttpResponse(f'No nurp parameter was specified')
+
+        samples_by_id, samples_by_component = sample_nurps[target_nurp_name]
+        if target_component_name and target_component_name not in samples_by_component:
+            return HttpResponse(f'Component not found: {target_component_name}')
+
         context['component'] = target_component_name
+        context['nurp'] = target_nurp_name
         if not target_capability_name:
-            capability_summary: Dict[CapabilityName, bool] = dict()
+            capability_summary: List[Dict] = list()
             component_records = samples_by_component[target_component_name]
             for capability_name in sorted(component_records.capabilities.keys()):
-                capability_summary[capability_name] = component_records.capabilities[capability_name].has_regressed(conclusions_by_id)
+                regressed = component_records.capabilities[capability_name].has_regressed(conclusions_by_nurp[target_nurp_name])
+                href_params = dict(context)
+                href_params['capability'] = capability_name
+                capability_summary.append({
+                    'name': capability_name,
+                    'status': ImageColumnLink(
+                        image_path='/main/red.png' if regressed else '/main/green.png',
+                        height=16, width=16,
+                        href='/main/report',
+                        href_params=href_params,
+                    )
+                })
 
-            context['summary'] = capability_summary
-            return render(request, 'main/report-capabilities.html', context)
+            table = AllComponentsTable(capability_summary,
+                                       extra_columns=[('status', ImageColumn())],
+                                       new_key='component',
+                                       params=dict(context))
+            context['table'] = table
+            context['breadcrumb'] = f'{target_nurp_name} > {target_component_name}'
+            return render(request, 'main/report-table.html', context)
         else:  # Rendering the capabilities of a specific component
-            test_summary: Dict[CapabilityName, (TestId, bool)] = dict()
+            test_summary: List[Dict] = list()
             context['capability'] = target_capability_name
             component_records = samples_by_component[target_component_name]
             if target_capability_name not in component_records.capabilities:
                 return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
+
             capability_records = component_records.capabilities[target_capability_name]
             for tr in sorted(list(capability_records.test_records.values()), key=lambda x: x.test_name):
-                test_summary[tr.test_name] = (tr.test_id, has_regression([tr], conclusions_by_id))
+                regressed = has_regression([tr], conclusions_by_nurp[target_nurp_name])
+                href_params = dict(context)
+                href_params['test_id'] = tr.test_id
+                test_summary.append({
+                    'name': tr.test_name,
+                    'status': ImageColumnLink(
+                        image_path='/main/red.png' if regressed else '/main/green.png',
+                        height=16, width=16,
+                        href='/main/report',
+                        href_params=href_params,
+                    )
+                })
 
-            context['summary'] = test_summary
-            return render(request, 'main/report-tests.html', context)
+            table = AllComponentsTable(test_summary, extra_columns=[('status', ImageColumn())])
+            context['table'] = table
+            context['breadcrumb'] = f'{target_nurp_name} > {target_component_name} > {target_capability_name}'
+            return render(request, 'main/report-table.html', context)

@@ -9,9 +9,9 @@ from multiprocessing import Pool
 import time
 
 # Set to true to sanity check the generated table against scipy calculated values
-scipy_sanity_check = False
+scipy_sanity_check = True
 
-MAX_CELL_SAMPLES = 512   # must be a power of 2 and divisible by 8
+MAX_CELL_SAMPLES = 32   # must be a power of 2 and divisible by 8
 # MAX_CELL_SAMPLES = 32
 # MAX_CELL_SAMPLES = 8
 MULTIPLICATION_SHIFTS = int(math.log2(MAX_CELL_SAMPLES))
@@ -45,7 +45,9 @@ if __name__ == '__main__':
         print('It will take too long to sanity check computed tables with > 64 samples')
         exit(1)
 
-    with open('table.bin', 'w+b') as f:
+    OUTPUT_FILENAME = 'table-gen.bin'
+
+    with open(OUTPUT_FILENAME, 'w+b') as f:
         with Pool(max(4, os.cpu_count() - 2)) as p:
             for result in p.imap_unordered(fisher_for_a, range(0, MAX_CELL_SAMPLES)):
                 a, bits = result
@@ -54,17 +56,25 @@ if __name__ == '__main__':
                 print(result)
 
     if scipy_sanity_check:
-        with open('table.bin', 'rb') as f:
+        with open(OUTPUT_FILENAME, 'rb') as f:
             all_bits = bitstring.BitArray(f)
             for a in range(0, MAX_CELL_SAMPLES):
                 print(f'Sanity checking: {a} of {MAX_CELL_SAMPLES-1}')
                 for b in range(0, MAX_CELL_SAMPLES):
                     for c in range(0, MAX_CELL_SAMPLES):
                         for d in range(0, MAX_CELL_SAMPLES):
+                            bit_offset = offset(a, b, c, d)
                             _, pvalue = scipy.stats.fisher_exact([[a, b], [c, d]], alternative='greater')
                             significant = (pvalue <= ALPHA)
-                            if significant != all_bits[offset(a, b, c, d)]:
+                            if significant != all_bits[bit_offset]:
                                 fisher_fast_pvalue = fast_fisher.fast_fisher_cython.fisher_exact(a, b, c, d, alternative="greater")
                                 if abs(fisher_fast_pvalue - pvalue) > 0.0000001:
                                     print(f'Difference at a={a} b={b} c={c} d={d} ; scipy got={pvalue}    and   fast got={fisher_fast_pvalue}')
-
+                            else:
+                                byte_offset = bit_offset // 8
+                                bit_shift = 7 - (bit_offset % 8)
+                                f.seek(byte_offset)
+                                v = f.read(1)[0]
+                                file_based_significant = (v & (1 << bit_shift)) > 0
+                                if significant != file_based_significant:
+                                    print(f'Difference at a={a} b={b} c={c} d={d} in file based read; scipy got={significant}    and   file got bit_offset={bit_offset}  byte_offset={byte_offset}  bit_shift={bit_shift} = {v}')

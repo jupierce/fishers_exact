@@ -3,7 +3,11 @@ import math
 import mmap
 from typing import Dict, NamedTuple, List
 from enum import Enum
+
+from django.utils.html import format_html
 from django.http import HttpResponse
+import django_tables2 as tables
+
 import fast_fisher.fast_fisher_cython
 
 from django.shortcuts import render
@@ -29,6 +33,14 @@ table_mmap = mmap.mmap(table_bin.fileno(), length=0, access=mmap.ACCESS_READ)
 
 
 def fisher_offset(a, b, c, d) -> int:
+    if a > 500 or b > 500:
+        reducer = min((500 / max(a, 1)), (500 / max(b, 1)))  # use max in case one of the values is 0
+        a = int(a * reducer)
+        b = int(b * reducer)
+    if c > 500 or d > 500:
+        reducer = min((500 / max(c, 1)), (500 / max(d, 1)))
+        c = int(c * reducer)
+        d = int(d * reducer)
     return (a << (MULTIPLICATION_SHIFTS * 3)) + (b << (MULTIPLICATION_SHIFTS * 2)) + (c << (MULTIPLICATION_SHIFTS * 1)) + d
 
 
@@ -164,6 +176,23 @@ def calculate_conclusions(basis_by_id: ById, samples_by_id: ById) -> ConclusionM
     return by_conclusion
 
 
+class AllComponentsTable(tables.Table):
+    name = tables.Column()
+    regression = tables.Column()
+
+    def __init__(self, data, new_key, params):
+        super().__init__(data)
+        self.params = params
+        self.new_key = new_key
+
+    class Meta:
+        attrs = {"class": "paleblue"}
+
+    def render_name(self, value):
+        params_str = '&'.join([f'{key}={value}' for key, value in self.params.items()])
+        return format_html(f'<a href="/main/report?{params_str}&{self.new_key}={value}">{value}</a>')
+
+
 def report(request):
     basis_release = request.GET['basis_release']
     basis_start_dt = request.GET['basis_start_dt']
@@ -212,7 +241,7 @@ def report(request):
         'sample_end_dt': sample_end_dt,
     }
 
-    if target_test_id:
+    if target_test_id:  # Rendering a specifically requested test id
         if target_test_id not in samples_by_id:
             return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
 
@@ -228,14 +257,21 @@ def report(request):
 
         return render(request, 'main/report-test.html', context)
 
-    if not target_component_name:
-        component_summary: Dict[ComponentName, bool] = dict()
+    if not target_component_name:  # Rendering all components
+        component_summary: List[Dict] = list()
         for component_name in sorted(list(samples_by_component.keys())):
-            component_summary[component_name] = samples_by_component[component_name].has_regressed(conclusions_by_id)
-
-        context['summary'] = component_summary
-        return render(request, 'main/report-components.html', context)
-    else:
+            component_summary.append(
+                {
+                    'name': component_name,
+                    'regression': samples_by_component[component_name].has_regressed(conclusions_by_id)
+                }
+            )
+        table = AllComponentsTable(component_summary,
+                                   new_key='component',
+                                   params=context)
+        context['table'] = table
+        return render(request, 'main/report-table.html', context)
+    else:  # Rendering all of a specific component's capabilities
         context['component'] = target_component_name
         if not target_capability_name:
             capability_summary: Dict[CapabilityName, bool] = dict()
@@ -245,7 +281,7 @@ def report(request):
 
             context['summary'] = capability_summary
             return render(request, 'main/report-capabilities.html', context)
-        else:
+        else:  # Rendering the capabilities of a specific component
             test_summary: Dict[CapabilityName, (TestId, bool)] = dict()
             context['capability'] = target_capability_name
             component_records = samples_by_component[target_component_name]

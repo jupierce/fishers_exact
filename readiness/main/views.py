@@ -273,25 +273,30 @@ def report(request):
     if target_nurp_name:
         target_nurp_filter = f'AND CONCAT(network, " ", upgrade, " ", arch, " ", platform) = "{target_nurp_name}" '
 
+    target_test_filter = ''
+    if target_test_id:
+        target_test_filter = f'AND test_id = "{target_test_id}" '
+
     bq = bigquery.Client()
     q = f'''
         SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count 
         FROM `openshift-gce-devel.ci_analysis_us.junit` 
-        WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter}
+        WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
               AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
     '''
 
     basis_rows = bq.query(q)
-    basis_nurps = categorize(basis_rows)
 
     q = f'''
         SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count
         FROM `openshift-gce-devel.ci_analysis_us.junit` 
-        WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter}
+        WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
               AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
     '''
 
     sample_rows = bq.query(q)
+
+    basis_nurps = categorize(basis_rows)
     sample_nurps = categorize(sample_rows)
 
     conclusions_by_nurp = calculate_conclusions(basis_nurps=basis_nurps, sample_nurps=sample_nurps)
@@ -333,7 +338,7 @@ def report(request):
         extra_columns = []
         all_component_names = set()
 
-        for nurp_name in conclusions_by_nurp:
+        for nurp_name in sorted(conclusions_by_nurp.keys()):
             image_href_params = dict(context)
             image_href_params['nurp'] = nurp_name
             extra_columns.append((nurp_name, ImageColumn()))
@@ -348,7 +353,7 @@ def report(request):
                 'name': component_name,
             }
 
-            for nurp_name in sorted(sample_nurps):
+            for nurp_name in sample_nurps:
                 _, samples_by_component = sample_nurps[nurp_name]
                 if component_name in samples_by_component:
                     regressed = samples_by_component[component_name].has_regressed(conclusions_by_nurp[nurp_name])

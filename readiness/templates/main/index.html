@@ -65,6 +65,9 @@
                   }
                 });
 
+                $('.selectmenu').selectmenu({
+                  change: function( event, ui ) {showReport();}
+                });
 
                 var now = new Date();
                 var last48 = new Date(now - (48 * 60 * 60 * 1000));
@@ -85,7 +88,7 @@
             <legend>Historical Comparison Basis</legend>
             <div class="basis_control_group">
                 <label for="basis_release">Release</label>
-                <select name="basis_release" id="basis_release">
+                <select name="basis_release" id="basis_release" class="selectmenu">
                     <option>4.10</option>
                     <option>4.11</option>
                     <option>4.12</option>
@@ -105,7 +108,7 @@
             <legend>Test Sample</legend>
             <div class="sample_control_group">
                 <label for="sample_release">Release</label>
-                <select name="sample_release" id="sample_release">
+                <select name="sample_release" id="sample_release" class="selectmenu">
                     <option>4.10</option>
                     <option>4.11</option>
                     <option>4.12</option>

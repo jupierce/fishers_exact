@@ -14,15 +14,23 @@
 </head>
 
 <body>
-Sample Release {{sample_release}} vs Basis Release {{basis_release}}
+<h2>{{breadcrumb}}</h2>
 <br>
 Test Name: {{sample_test.test_name}}
 <br>
-Sample Successes: {{sample_test.success_count}} <br>
-Sample Failures: {{sample_test.failure_count}} <br>
+<br>
+Sample Release {{sample_release}}<br>
+<ul>
+        <li>Successes: {{sample_test.success_count}}</li>
+        <li>Failures: {{sample_test.failure_count}}</li>
+</ul>
+<br>
 <br> <br>
-Basis Successes: {{basis_test.success_count}} <br>
-Basis Failures: {{basis_test.failure_count}} <br>
+Basis Release {{basis_release}} <br>
+<ul>
+        <li>Successes: {{basis_test.success_count}}</li>
+        <li>Failures: {{basis_test.failure_count}}</li>
+</ul>
 
 <br> <br>
 Fisher's Exact: {{fishers_exact}}

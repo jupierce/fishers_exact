@@ -1,6 +1,9 @@
 import re
 import math
 import mmap
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable
 from enum import Enum
 
@@ -48,6 +51,9 @@ def fisher_offset(a, b, c, d) -> int:
 
 
 def fisher_significant(a, b, c, d) -> bool:
+    if a > 500 or b > 500 or c > 500 or d > 500:
+        return fast_fisher.fast_fisher_cython.fisher_exact(a, b, c, d, alternative='greater') < 0.05
+    # Otherwise, look it up faster in the precomputed data
     offset = fisher_offset(a, b, c, d)
     bin_offset = offset // 8
     bit_shift = 7 - (offset % 8)
@@ -256,18 +262,25 @@ class AllComponentsTable(tables.Table):
 
 
 def report(request):
-    basis_release = request.GET['basis_release']
-    basis_start_dt = request.GET['basis_start_dt']
-    basis_end_dt = request.GET['basis_end_dt']
 
-    sample_release = request.GET['sample_release']
-    sample_start_dt = request.GET['sample_start_dt']
-    sample_end_dt = request.GET['sample_end_dt']
+    def insufficient_sanitization(parameter_name: str, parameter_default: Optional[str]=None) -> Optional[str]:
+        val = request.GET.get(parameter_name, parameter_default)
+        if val is not None and ("'" in val or '"' in val or '\\' in val):
+            raise IOError('Sanitization failure')
+        return val
 
-    target_component_name = request.GET.get('component', None)
-    target_capability_name = request.GET.get('capability', None)
-    target_test_id = request.GET.get('test_id', None)
-    target_nurp_name = request.GET.get('nurp', None)
+    basis_release = insufficient_sanitization('basis_release')
+    basis_start_dt = insufficient_sanitization('basis_start_dt')
+    basis_end_dt = insufficient_sanitization('basis_end_dt')
+
+    sample_release = insufficient_sanitization('sample_release')
+    sample_start_dt = insufficient_sanitization('sample_start_dt')
+    sample_end_dt = insufficient_sanitization('sample_end_dt')
+
+    target_component_name = insufficient_sanitization('component', None)
+    target_capability_name = insufficient_sanitization('capability', None)
+    target_test_id = insufficient_sanitization('test_id', None)
+    target_nurp_name = insufficient_sanitization('nurp', None)
 
     target_nurp_filter = ''
     if target_nurp_name:
@@ -284,7 +297,6 @@ def report(request):
         WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
               AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
     '''
-
     basis_rows = bq.query(q)
 
     q = f'''
@@ -296,8 +308,21 @@ def report(request):
 
     sample_rows = bq.query(q)
 
-    basis_nurps = categorize(basis_rows)
-    sample_nurps = categorize(sample_rows)
+
+    # Performance note: the .query() calls return relatively quickly. Bigquery is doing the calculations
+    # and python will only block when you try to read rows that haven't been calculated yet.
+    # Thus, the majority of the time spent will usually be in categorize where the data is actually being
+    # read.
+    # Based on simple profiling, it looks like data normally starts to stream in fairly quickly, but
+    # getting to the end takes awhile. So categorize gets its first records in a few seconds, but
+    # runs for 10 times that long despite not doing much computation itself (i.e. it is blocking
+    # waiting for bigquery).
+
+    executor = ThreadPoolExecutor(2)
+    basis_future = executor.submit(categorize, (basis_rows))
+    sample_future = executor.submit(categorize, (sample_rows))
+    basis_nurps = basis_future.result()
+    sample_nurps = sample_future.result()
 
     conclusions_by_nurp = calculate_conclusions(basis_nurps=basis_nurps, sample_nurps=sample_nurps)
 
@@ -375,8 +400,7 @@ def report(request):
 
         table = AllComponentsTable(component_summary,
                                    extra_columns=extra_columns,
-                                   new_key='component',
-                                   params=dict(context))
+                                   )
         context['table'] = table
         context['breadcrumb'] = f'All Components'
         return render(request, 'main/report-table.html', context)
@@ -407,10 +431,7 @@ def report(request):
                     )
                 })
 
-            table = AllComponentsTable(capability_summary,
-                                       extra_columns=[('status', ImageColumn())],
-                                       new_key='component',
-                                       params=dict(context))
+            table = AllComponentsTable(capability_summary, extra_columns=[('status', ImageColumn())])
             context['table'] = table
             context['breadcrumb'] = f'{target_nurp_name} > {target_component_name}'
             return render(request, 'main/report-table.html', context)

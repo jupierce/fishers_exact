@@ -2,6 +2,7 @@ import re
 import math
 import mmap
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable
@@ -33,8 +34,13 @@ if (1 << MULTIPLICATION_SHIFTS) != MAX_CELL_SAMPLES or MAX_CELL_SAMPLES//8*8 != 
 
 ALPHA = 0.05
 
-table_bin = open(f'{BASE_DIR}/../table.bin', 'rb')
-table_mmap = mmap.mmap(table_bin.fileno(), length=0, access=mmap.ACCESS_READ)
+try:
+    table_bin = open(f'{BASE_DIR}/../table.bin', 'rb')
+    table_mmap = mmap.mmap(table_bin.fileno(), length=0, access=mmap.ACCESS_READ)
+except:
+    print(f'WARNING: Precomputed fishers will not be used.')
+    table_mmap = None
+    traceback.print_exc()
 
 
 def fisher_offset(a, b, c, d) -> int:
@@ -51,7 +57,7 @@ def fisher_offset(a, b, c, d) -> int:
 
 
 def fisher_significant(a, b, c, d) -> bool:
-    if a > 500 or b > 500 or c > 500 or d > 500:
+    if (not table_mmap) or a > 500 or b > 500 or c > 500 or d > 500:
         return fast_fisher.fast_fisher_cython.fisher_exact(a, b, c, d, alternative='greater') < 0.05
     # Otherwise, look it up faster in the precomputed data
     offset = fisher_offset(a, b, c, d)
@@ -61,11 +67,20 @@ def fisher_significant(a, b, c, d) -> bool:
 
 
 class TestRecord(NamedTuple):
-    test_id: TestId
-    test_name: str
+    test_id: Optional[TestId]
+    test_name: Optional[str]
     success_count: int
     failure_count: int
     total_count: int
+
+
+NO_TESTS = TestRecord(
+    test_id=None,
+    test_name=None,
+    success_count=0,
+    failure_count=0,
+    total_count=0,
+)
 
 
 class Conclusion(Enum):
@@ -235,6 +250,16 @@ def dict_to_params_url(params):
     return '&'.join([f'{key}={value}' for key, value in params.items()])
 
 
+class ProwjobTable(tables.Table):
+    prowjob_name = tables.Column()
+    basis_info = tables.Column()
+    sample_info = tables.Column()
+    regression = ImageColumn()
+
+    class Meta:
+        attrs = {"class": "paleblue"}
+
+
 class AllComponentsTable(tables.Table):
     name = tables.Column()
 
@@ -355,6 +380,92 @@ def report(request):
             alternative='greater'
         ))
 
+        q = f'''
+            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count 
+            FROM `openshift-gce-devel.ci_analysis_us.junit` 
+            WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
+                  AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, prowjob_name        
+        '''
+        basis_prowjob_runs_rows = bq.query(q)
+
+        q = f'''
+            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count
+            FROM `openshift-gce-devel.ci_analysis_us.junit` 
+            WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
+                  AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, prowjob_name        
+        '''
+
+        sample_prowjob_runs_rows = bq.query(q)
+
+        # Aggregate test successes/failures by prowjob
+        prowjob_names = set()
+        basis_prowjob_runs: Dict[str, TestRecord] = dict()
+        for row in basis_prowjob_runs_rows:
+            prowjob_name = row['prowjob_name']
+            prowjob_names.add(prowjob_name)
+            basis_prowjob_runs[prowjob_name] = TestRecord(
+                test_id=target_test_id,
+                test_name=None,
+                success_count=row['success_count'],
+                total_count=row['total_count'],
+                failure_count=row['total_count'] - row['success_count'],
+            )
+
+        sample_prowjob_runs: Dict[str, TestRecord] = dict()
+        for row in sample_prowjob_runs_rows:
+            prowjob_name = row['prowjob_name']
+            prowjob_names.add(prowjob_name)
+            sample_prowjob_runs[prowjob_name] = TestRecord(
+                test_id=target_test_id,
+                test_name=None,
+                success_count=row['success_count'],
+                total_count=row['total_count'],
+                failure_count=row['total_count'] - row['success_count'],
+            )
+
+        prowjob_analysis: List[Dict[str, str]] = list()
+        for prowjob_name in sorted(prowjob_names):
+            basis_result = basis_prowjob_runs.get(prowjob_name, NO_TESTS)
+            sample_result = sample_prowjob_runs.get(prowjob_name, NO_TESTS)
+
+            if basis_result.total_count == 0 or sample_result.total_count == 0:
+                regressed = False
+            else:
+                basis_pass_percentage = basis_result.success_count / basis_result.total_count
+                sample_pass_percentage = sample_result.success_count / sample_result.total_count
+                improved = sample_pass_percentage >= basis_pass_percentage
+
+                regressed = fisher_significant(
+                    sample_result.failure_count,
+                    sample_result.success_count,
+                    basis_result.failure_count,
+                    basis_result.success_count,
+                )
+
+                if improved:
+                    regressed = False
+
+            basis_success_count = basis_result.success_count
+            basis_failure_count = basis_result.failure_count
+            sample_success_count = sample_result.success_count
+            sample_failure_count = sample_result.failure_count
+
+            prowjob_analysis.append(
+                {
+                    'prowjob_name': prowjob_name,
+                    'basis_info': f'successes={basis_success_count} failures={basis_failure_count}',
+                    'sample_info': f'successes={sample_success_count} failures={sample_failure_count}',
+                    'regression': ImageColumnLink(
+                        image_path='/main/red.png' if regressed else '/main/green.png',
+                        height=16, width=16,
+                        href=None,
+                        href_params=dict()
+                    )
+                }
+            )
+
+        prowjob_table = ProwjobTable(data=prowjob_analysis)
+        context['table'] = prowjob_table
         context['breadcrumb'] = f'{target_nurp_name} > {target_component_name} > {target_capability_name} > {sample_test_record.test_name}'
         return render(request, 'main/report-test.html', context)
 

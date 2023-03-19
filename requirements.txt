@@ -2,3 +2,4 @@ django
 django-tables2
 cython
 fast-fisher
+google-cloud-bigquery

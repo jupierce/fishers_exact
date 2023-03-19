@@ -26,7 +26,7 @@ SECRET_KEY = 'django-insecure-zs=-t^ns+e)-j)e26ule$ncdxpb!h7%5d5x!=9e(ra!hsc0-+(
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = ['*']
 
 DJANGO_TABLES2_TEMPLATE = "django_tables2/table.html"
 

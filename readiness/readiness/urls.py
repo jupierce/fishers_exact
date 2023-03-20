@@ -1,3 +1,5 @@
+from django.http import HttpResponseRedirect
+
 """readiness URL Configuration
 
 The `urlpatterns` list routes URLs to views. For more information please see:
@@ -17,6 +19,7 @@ from django.contrib import admin
 from django.urls import path, include
 
 urlpatterns = [
+    path('', lambda r: HttpResponseRedirect('main/')),
     path('main/', include('main.urls')),
     path('admin/', admin.site.urls),
 ]

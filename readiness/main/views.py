@@ -254,7 +254,7 @@ class ProwjobTable(tables.Table):
     prowjob_name = tables.Column()
     basis_info = tables.Column()
     sample_info = tables.Column()
-    regression = ImageColumn()
+    individual_job_regression = ImageColumn()
 
     class Meta:
         attrs = {"class": "paleblue"}
@@ -455,7 +455,7 @@ def report(request):
                     'prowjob_name': prowjob_name,
                     'basis_info': f'successes={basis_success_count} failures={basis_failure_count}',
                     'sample_info': f'successes={sample_success_count} failures={sample_failure_count}',
-                    'regression': ImageColumnLink(
+                    'individual_job_regression': ImageColumnLink(
                         image_path='/main/red.png' if regressed else '/main/green.png',
                         height=16, width=16,
                         href=None,

@@ -17,9 +17,12 @@
 
             //  This function communicates with django (backend)
 
-            function date_to_dt(d) {
+            function date_to_dt(d, zero_hours=true) {
                 var components =  d.toISOString().split('T');
-                var hours = components[1].split(':')[0]
+                var hours = components[1].split(':')[0];
+                if (zero_hours) {
+                    hours = "00";
+                }
                 return components[0] + " " + hours + ":00";
             }
 

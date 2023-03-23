@@ -25,6 +25,7 @@ Sample Release {{sample_release}}<br>
 <ul>
         <li>Successes: {{sample_test.success_count}}</li>
         <li>Failures: {{sample_test.failure_count}}</li>
+        <li>Flakes: {{sample_test.flake_count}} (ignored test runs)</li>
 </ul>
 <br>
 <br> <br>
@@ -32,12 +33,18 @@ Basis Release {{basis_release}} <br>
 <ul>
         <li>Successes: {{basis_test.success_count}}</li>
         <li>Failures: {{basis_test.failure_count}}</li>
+        <li>Flakes: {{basis_test.flake_count}} (ignored test runs)</li>
 </ul>
 
 <br> <br>
 Fisher's Exact: {{fishers_exact}}
 <br><br>
 
+Note: It is possible for this test to be RED and all prowjobs to be GREEN. It means that a statistically significant regression
+of the test was not detected at the individual prowjob level and that the regression could only be detected when the results of
+all the different prowjobs were summed together.
+<br>
+<br>
 {% render_table table %}
 
 </body>

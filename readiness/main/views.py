@@ -72,6 +72,7 @@ class TestRecord(NamedTuple):
     success_count: int
     failure_count: int
     total_count: int
+    flake_count: int
 
 
 NO_TESTS = TestRecord(
@@ -80,6 +81,7 @@ NO_TESTS = TestRecord(
     success_count=0,
     failure_count=0,
     total_count=0,
+    flake_count=0,
 )
 
 
@@ -166,12 +168,18 @@ def categorize(rows) -> Dict[Nurp, Tuple[ById, ByComponent]]:
             # Not sure why, but bigquery can return None for some SUMs.
             # Potentially because success_val was not set on all original rows
             continue
+
+        flake_count = row['flake_count']
+        success_count = row['success_count']
+        total_count = row['total_count']
+
         r = TestRecord(
             test_id=row['test_id'],
             test_name=row['test_name'],
-            success_count=row['success_count'],
-            failure_count=row['total_count'] - row['success_count'],
-            total_count=row['total_count'],
+            success_count=success_count,
+            failure_count=total_count - success_count - flake_count,
+            total_count=total_count - flake_count,
+            flake_count=flake_count
         )
         by_id[r.test_id] = r
         labels = re.findall(component_pattern, r.test_name)
@@ -317,7 +325,7 @@ def report(request):
 
     bq = bigquery.Client()
     q = f'''
-        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count 
+        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
         FROM `openshift-gce-devel.ci_analysis_us.junit` 
         WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
               AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
@@ -325,7 +333,7 @@ def report(request):
     basis_rows = bq.query(q)
 
     q = f'''
-        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count
+        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
         FROM `openshift-gce-devel.ci_analysis_us.junit` 
         WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
               AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
@@ -371,7 +379,7 @@ def report(request):
             return HttpResponse(f'Target test {target_test_id} not found in nurp: {target_nurp_name}')
 
         sample_test_record = samples_by_id[target_test_id]
-        basis_test_record = basis_by_id.get(target_test_id, TestRecord(test_name='', total_count=0, success_count=0, failure_count=0, test_id=target_test_id))
+        basis_test_record = basis_by_id.get(target_test_id, TestRecord(test_name='', total_count=0, success_count=0, failure_count=0, test_id=target_test_id, flake_count=0))
         context['sample_test'] = sample_test_record
         context['basis_test'] = basis_test_record
         context['fishers_exact'] = str(fast_fisher.fast_fisher_cython.fisher_exact(
@@ -381,7 +389,7 @@ def report(request):
         ))
 
         q = f'''
-            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count 
+            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count 
             FROM `openshift-gce-devel.ci_analysis_us.junit` 
             WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
                   AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, prowjob_name        
@@ -389,7 +397,7 @@ def report(request):
         basis_prowjob_runs_rows = bq.query(q)
 
         q = f'''
-            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count
+            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
             FROM `openshift-gce-devel.ci_analysis_us.junit` 
             WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
                   AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, prowjob_name        
@@ -401,26 +409,36 @@ def report(request):
         prowjob_names = set()
         basis_prowjob_runs: Dict[str, TestRecord] = dict()
         for row in basis_prowjob_runs_rows:
-            prowjob_name = row['prowjob_name']
+            prowjob_name: str = row['prowjob_name']
+            prowjob_name = prowjob_name.replace(basis_release, 'X.X')  # Strip release specific information from prowjob name
             prowjob_names.add(prowjob_name)
+            flake_count = row['flake_count']
+            success_count = row['success_count']
+            total_count = row['total_count']
             basis_prowjob_runs[prowjob_name] = TestRecord(
                 test_id=target_test_id,
                 test_name=None,
-                success_count=row['success_count'],
-                total_count=row['total_count'],
-                failure_count=row['total_count'] - row['success_count'],
+                success_count=success_count,
+                total_count=total_count - flake_count,
+                failure_count=total_count - success_count - flake_count,
+                flake_count=flake_count,
             )
 
         sample_prowjob_runs: Dict[str, TestRecord] = dict()
         for row in sample_prowjob_runs_rows:
             prowjob_name = row['prowjob_name']
+            prowjob_name = prowjob_name.replace(sample_release, 'X.X')  # Strip release specific information from prowjob name
             prowjob_names.add(prowjob_name)
+            flake_count = row['flake_count']
+            success_count = row['success_count']
+            total_count = row['total_count']
             sample_prowjob_runs[prowjob_name] = TestRecord(
                 test_id=target_test_id,
                 test_name=None,
-                success_count=row['success_count'],
-                total_count=row['total_count'],
-                failure_count=row['total_count'] - row['success_count'],
+                success_count=success_count,
+                total_count=total_count - flake_count,
+                failure_count=total_count - success_count - flake_count,
+                flake_count=flake_count,
             )
 
         prowjob_analysis: List[Dict[str, str]] = list()
@@ -447,14 +465,16 @@ def report(request):
 
             basis_success_count = basis_result.success_count
             basis_failure_count = basis_result.failure_count
+            basis_flake_count = basis_result.flake_count
             sample_success_count = sample_result.success_count
             sample_failure_count = sample_result.failure_count
+            sample_flake_count = sample_result.flake_count
 
             prowjob_analysis.append(
                 {
                     'prowjob_name': prowjob_name,
-                    'basis_info': f'successes={basis_success_count} failures={basis_failure_count}',
-                    'sample_info': f'successes={sample_success_count} failures={sample_failure_count}',
+                    'basis_info': f'successes={basis_success_count} failures={basis_failure_count} (flakes={basis_flake_count})',
+                    'sample_info': f'successes={sample_success_count} failures={sample_failure_count} (flakes={sample_flake_count})',
                     'individual_job_regression': ImageColumnLink(
                         image_path='/main/red.png' if regressed else '/main/green.png',
                         height=16, width=16,

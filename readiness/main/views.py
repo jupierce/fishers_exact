@@ -171,14 +171,17 @@ def categorize(rows) -> Dict[Nurp, Tuple[ById, ByComponent]]:
 
         flake_count = row['flake_count']
         success_count = row['success_count']
-        total_count = row['total_count']
+        # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
+        # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
+        # failure) is included. This could make total_count - flake_count a negative value.
+        total_count = max(success_count, row['total_count'] - flake_count)
 
         r = TestRecord(
             test_id=row['test_id'],
             test_name=row['test_name'],
             success_count=success_count,
-            failure_count=total_count - success_count - flake_count,
-            total_count=total_count - flake_count,
+            failure_count=total_count - success_count,
+            total_count=total_count,
             flake_count=flake_count
         )
         by_id[r.test_id] = r
@@ -287,8 +290,8 @@ class AllComponentsTable(tables.Table):
         if self.new_key:
             params[self.new_key] = value
 
-        if self.params:
-            params_str = dict_to_params_url(self.params)
+        if params:
+            params_str = dict_to_params_url(params)
             return format_html(f'<a href="/main/report?{params_str}">{value}</a>')
         else:
             return value
@@ -414,13 +417,16 @@ def report(request):
             prowjob_names.add(prowjob_name)
             flake_count = row['flake_count']
             success_count = row['success_count']
-            total_count = row['total_count']
+            # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
+            # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
+            # failure) is included. This could make total_count - flake_count a negative value.
+            total_count = max(success_count, row['total_count'] - flake_count)
             basis_prowjob_runs[prowjob_name] = TestRecord(
                 test_id=target_test_id,
                 test_name=None,
                 success_count=success_count,
-                total_count=total_count - flake_count,
-                failure_count=total_count - success_count - flake_count,
+                total_count=total_count,
+                failure_count=total_count - success_count,
                 flake_count=flake_count,
             )
 
@@ -431,13 +437,16 @@ def report(request):
             prowjob_names.add(prowjob_name)
             flake_count = row['flake_count']
             success_count = row['success_count']
-            total_count = row['total_count']
+            # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
+            # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
+            # failure) is included. This could make total_count - flake_count a negative value.
+            total_count = max(success_count, row['total_count'] - flake_count)
             sample_prowjob_runs[prowjob_name] = TestRecord(
                 test_id=target_test_id,
                 test_name=None,
                 success_count=success_count,
-                total_count=total_count - flake_count,
-                failure_count=total_count - success_count - flake_count,
+                total_count=total_count,
+                failure_count=total_count - success_count,
                 flake_count=flake_count,
             )
 
@@ -531,64 +540,104 @@ def report(request):
 
         table = AllComponentsTable(component_summary,
                                    extra_columns=extra_columns,
+                                   new_key='component',
+                                   params=dict(context),
                                    )
         context['table'] = table
         context['breadcrumb'] = f'All Components'
         return render(request, 'main/report-table.html', context)
     else:  # Rendering all of a specific component's capabilities
-        if not target_nurp_name:
-            return HttpResponse(f'No nurp parameter was specified')
-
-        samples_by_id, samples_by_component = sample_nurps[target_nurp_name]
-        if target_component_name and target_component_name not in samples_by_component:
-            return HttpResponse(f'Component not found: {target_component_name}')
 
         context['component'] = target_component_name
-        context['nurp'] = target_nurp_name
-        if not target_capability_name:
+
+        if not target_nurp_name:  # Rendering a component with nurps as column heading
+            extra_columns = []
+
+            for nurp_name in sorted(conclusions_by_nurp.keys()):
+                image_href_params = dict(context)
+                image_href_params['nurp'] = nurp_name
+                extra_columns.append((nurp_name, ImageColumn()))
+                _, by_component = sample_nurps[nurp_name]
+
             capability_summary: List[Dict] = list()
-            component_records = samples_by_component[target_component_name]
-            for capability_name in sorted(component_records.capabilities.keys()):
-                regressed = component_records.capabilities[capability_name].has_regressed(conclusions_by_nurp[target_nurp_name])
-                href_params = dict(context)
-                href_params['capability'] = capability_name
-                capability_summary.append({
+
+            for capability_name, capability_record in by_component[target_component_name].capabilities.items():
+
+                row = {
                     'name': capability_name,
-                    'status': ImageColumnLink(
+                }
+
+                for nurp_name in sample_nurps:
+                    regressed = capability_record.has_regressed(conclusions_by_nurp[nurp_name])
+                    href_params = dict(context)
+                    href_params['capability'] = capability_name
+                    href_params['nurp'] = nurp_name
+                    row[nurp_name] = ImageColumnLink(
                         image_path='/main/red.png' if regressed else '/main/green.png',
                         height=16, width=16,
                         href='/main/report',
                         href_params=href_params,
                     )
-                })
 
-            table = AllComponentsTable(capability_summary, extra_columns=[('status', ImageColumn())])
+                capability_summary.append(row)
+
+            table = AllComponentsTable(capability_summary,
+                                       extra_columns=extra_columns,
+                                       )
             context['table'] = table
-            context['breadcrumb'] = f'{target_nurp_name} > {target_component_name}'
+            context['breadcrumb'] = f'{target_component_name}'
             return render(request, 'main/report-table.html', context)
-        else:  # Rendering the capabilities of a specific component
-            test_summary: List[Dict] = list()
-            context['capability'] = target_capability_name
-            component_records = samples_by_component[target_component_name]
-            if target_capability_name not in component_records.capabilities:
-                return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
 
-            capability_records = component_records.capabilities[target_capability_name]
-            for tr in sorted(list(capability_records.test_records.values()), key=lambda x: x.test_name):
-                regressed = has_regression([tr], conclusions_by_nurp[target_nurp_name])
-                href_params = dict(context)
-                href_params['test_id'] = tr.test_id
-                test_summary.append({
-                    'name': tr.test_name,
-                    'status': ImageColumnLink(
-                        image_path='/main/red.png' if regressed else '/main/green.png',
-                        height=16, width=16,
-                        href='/main/report',
-                        href_params=href_params,
-                    )
-                })
+        else:
+            samples_by_id, samples_by_component = sample_nurps[target_nurp_name]
+            if target_component_name and target_component_name not in samples_by_component:
+                return HttpResponse(f'Component not found: {target_component_name}')
 
-            table = AllComponentsTable(test_summary, extra_columns=[('status', ImageColumn())])
-            context['table'] = table
-            context['breadcrumb'] = f'{target_nurp_name} > {target_component_name} > {target_capability_name}'
-            return render(request, 'main/report-table.html', context)
+            context['nurp'] = target_nurp_name
+            if not target_capability_name:
+                capability_summary: List[Dict] = list()
+                component_records = samples_by_component[target_component_name]
+                for capability_name in sorted(component_records.capabilities.keys()):
+                    regressed = component_records.capabilities[capability_name].has_regressed(conclusions_by_nurp[target_nurp_name])
+                    href_params = dict(context)
+                    href_params['capability'] = capability_name
+                    capability_summary.append({
+                        'name': capability_name,
+                        'status': ImageColumnLink(
+                            image_path='/main/red.png' if regressed else '/main/green.png',
+                            height=16, width=16,
+                            href='/main/report',
+                            href_params=href_params,
+                        )
+                    })
+
+                table = AllComponentsTable(capability_summary, extra_columns=[('status', ImageColumn())])
+                context['table'] = table
+                context['breadcrumb'] = f'{target_nurp_name} > {target_component_name}'
+                return render(request, 'main/report-table.html', context)
+            else:  # Rendering the capabilities of a specific component
+                test_summary: List[Dict] = list()
+                context['capability'] = target_capability_name
+                component_records = samples_by_component[target_component_name]
+                if target_capability_name not in component_records.capabilities:
+                    return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
+
+                capability_records = component_records.capabilities[target_capability_name]
+                for tr in sorted(list(capability_records.test_records.values()), key=lambda x: x.test_name):
+                    regressed = has_regression([tr], conclusions_by_nurp[target_nurp_name])
+                    href_params = dict(context)
+                    href_params['test_id'] = tr.test_id
+                    test_summary.append({
+                        'name': tr.test_name,
+                        'status': ImageColumnLink(
+                            image_path='/main/red.png' if regressed else '/main/green.png',
+                            height=16, width=16,
+                            href='/main/report',
+                            href_params=href_params,
+                        )
+                    })
+
+                table = AllComponentsTable(test_summary, extra_columns=[('status', ImageColumn())])
+                context['table'] = table
+                context['breadcrumb'] = f'{target_nurp_name} > {target_component_name} > {target_capability_name}'
+                return render(request, 'main/report-table.html', context)

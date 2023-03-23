@@ -550,43 +550,86 @@ def report(request):
 
         context['component'] = target_component_name
 
-        if not target_nurp_name:  # Rendering a component with nurps as column heading
-            extra_columns = []
+        if not target_nurp_name:  # Rendering a component or capability with nurps as column heading
 
-            for nurp_name in sorted(conclusions_by_nurp.keys()):
-                image_href_params = dict(context)
-                image_href_params['nurp'] = nurp_name
-                extra_columns.append((nurp_name, ImageColumn()))
-                _, by_component = sample_nurps[nurp_name]
+            if target_capability_name:
+                extra_columns = []
 
-            capability_summary: List[Dict] = list()
+                for nurp_name in sorted(conclusions_by_nurp.keys()):
+                    image_href_params = dict(context)
+                    image_href_params['nurp'] = nurp_name
+                    extra_columns.append((nurp_name, ImageColumn()))
+                    _, by_component = sample_nurps[nurp_name]
 
-            for capability_name, capability_record in by_component[target_component_name].capabilities.items():
+                test_summary: List[Dict] = list()
 
-                row = {
-                    'name': capability_name,
-                }
+                for test_id, test_record in by_component[target_component_name].capabilities[target_capability_name].test_records.items():
 
-                for nurp_name in sample_nurps:
-                    regressed = capability_record.has_regressed(conclusions_by_nurp[nurp_name])
-                    href_params = dict(context)
-                    href_params['capability'] = capability_name
-                    href_params['nurp'] = nurp_name
-                    row[nurp_name] = ImageColumnLink(
-                        image_path='/main/red.png' if regressed else '/main/green.png',
-                        height=16, width=16,
-                        href='/main/report',
-                        href_params=href_params,
-                    )
+                    row = {
+                        'name': test_record.test_name,
+                    }
 
-                capability_summary.append(row)
+                    for nurp_name in sample_nurps:
+                        regressed = has_regression([test_record], conclusions=conclusions_by_nurp[nurp_name])
+                        href_params = dict(context)
+                        href_params['capability'] = target_capability_name
+                        href_params['test_id'] = test_id
+                        href_params['nurp'] = nurp_name
+                        row[nurp_name] = ImageColumnLink(
+                            image_path='/main/red.png' if regressed else '/main/green.png',
+                            height=16, width=16,
+                            href='/main/report',
+                            href_params=href_params,
+                        )
 
-            table = AllComponentsTable(capability_summary,
-                                       extra_columns=extra_columns,
-                                       )
-            context['table'] = table
-            context['breadcrumb'] = f'{target_component_name}'
-            return render(request, 'main/report-table.html', context)
+                    test_summary.append(row)
+
+                table = AllComponentsTable(test_summary,
+                                           extra_columns=extra_columns,
+                                           )
+                context['table'] = table
+                context['breadcrumb'] = f'{target_component_name} > {target_capability_name}'
+                return render(request, 'main/report-table.html', context)
+
+            else:
+                extra_columns = []
+
+                for nurp_name in sorted(conclusions_by_nurp.keys()):
+                    image_href_params = dict(context)
+                    image_href_params['nurp'] = nurp_name
+                    extra_columns.append((nurp_name, ImageColumn()))
+                    _, by_component = sample_nurps[nurp_name]
+
+                capability_summary: List[Dict] = list()
+
+                for capability_name, capability_record in by_component[target_component_name].capabilities.items():
+
+                    row = {
+                        'name': capability_name,
+                    }
+
+                    for nurp_name in sample_nurps:
+                        regressed = capability_record.has_regressed(conclusions_by_nurp[nurp_name])
+                        href_params = dict(context)
+                        href_params['capability'] = capability_name
+                        href_params['nurp'] = nurp_name
+                        row[nurp_name] = ImageColumnLink(
+                            image_path='/main/red.png' if regressed else '/main/green.png',
+                            height=16, width=16,
+                            href='/main/report',
+                            href_params=href_params,
+                        )
+
+                    capability_summary.append(row)
+
+                table = AllComponentsTable(capability_summary,
+                                           extra_columns=extra_columns,
+                                           new_key='capability',
+                                           params=dict(context)
+                                           )
+                context['table'] = table
+                context['breadcrumb'] = f'{target_component_name}'
+                return render(request, 'main/report-table.html', context)
 
         else:
             samples_by_id, samples_by_component = sample_nurps[target_nurp_name]

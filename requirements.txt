@@ -3,3 +3,5 @@ django-tables2
 cython
 fast-fisher
 google-cloud-bigquery
+sqlalchemy>=1.1.9,<2.0.0
+sqlalchemy-bigquery

@@ -1,239 +1,43 @@
-import re
-import math
-import mmap
-import time
-import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable
-from enum import Enum
+from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable, Set
 
 from django.utils.html import format_html
 from django.http import HttpResponse
 import django_tables2 as tables
 
+from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId
+from .fishers import fisher_significant
+
 import fast_fisher.fast_fisher_cython
 
+
 from django.shortcuts import render
-from readiness.settings import BASE_DIR
 
-from google.cloud import bigquery
-
-
-Nurp = str
-TestId = str
-ComponentName = str
-CapabilityName = str
-
-MAX_CELL_SAMPLES = 512   # must be a power of 2 and divisible by 8
-MULTIPLICATION_SHIFTS = int(math.log2(MAX_CELL_SAMPLES))
-
-if (1 << MULTIPLICATION_SHIFTS) != MAX_CELL_SAMPLES or MAX_CELL_SAMPLES//8*8 != MAX_CELL_SAMPLES:
-    print(f'MAX_CELL_SAMPLES must be a power of 2 and divisible by 8')
-    exit(1)
-
-ALPHA = 0.05
-
-try:
-    table_bin = open(f'{BASE_DIR}/../table.bin', 'rb')
-    table_mmap = mmap.mmap(table_bin.fileno(), length=0, access=mmap.ACCESS_READ)
-except:
-    print(f'WARNING: Precomputed fishers will not be used.')
-    table_mmap = None
-    traceback.print_exc()
-
-
-def fisher_offset(a, b, c, d) -> int:
-    # TODO: use chi^2 instead of normalizing to 500 samples?
-    if a > 500 or b > 500:
-        reducer = min((500 / max(a, 1)), (500 / max(b, 1)))  # use max in case one of the values is 0
-        a = int(a * reducer)
-        b = int(b * reducer)
-    if c > 500 or d > 500:
-        reducer = min((500 / max(c, 1)), (500 / max(d, 1)))
-        c = int(c * reducer)
-        d = int(d * reducer)
-    return (a << (MULTIPLICATION_SHIFTS * 3)) + (b << (MULTIPLICATION_SHIFTS * 2)) + (c << (MULTIPLICATION_SHIFTS * 1)) + d
-
-
-def fisher_significant(a, b, c, d) -> bool:
-    if (not table_mmap) or a > 500 or b > 500 or c > 500 or d > 500:
-        return fast_fisher.fast_fisher_cython.fisher_exact(a, b, c, d, alternative='greater') < 0.05
-    # Otherwise, look it up faster in the precomputed data
-    offset = fisher_offset(a, b, c, d)
-    bin_offset = offset // 8
-    bit_shift = 7 - (offset % 8)
-    return table_mmap[bin_offset] & (1 << bit_shift) > 0
-
-
-class TestRecord(NamedTuple):
-    test_id: Optional[TestId]
-    test_name: Optional[str]
-    success_count: int
-    failure_count: int
-    total_count: int
-    flake_count: int
-
-
-NO_TESTS = TestRecord(
-    test_id=None,
-    test_name=None,
-    success_count=0,
-    failure_count=0,
-    total_count=0,
-    flake_count=0,
-)
-
-
-class Conclusion(Enum):
-    MISSING_IN_BASIS = 1
-    SIGNIFICANT_IMPROVEMENT = 2
-    SIGNIFICANT_REGRESSION = 3
-
-
-ConclusionMap = Dict[Nurp, Dict[TestId, Conclusion]]
-
-
-def has_regression(records: Iterable[TestRecord], conclusions: Dict[TestId, Conclusion]) -> bool:
-    """
-    :param records: The records to analyze
-    :param conclusions: The conclusions for all tests analyzed
-    :return: Returns True if even on TestRecord is a regression.
-    """
-    for record in records:
-        conclusion = conclusions.get(record.test_id, None)
-        if conclusion == Conclusion.SIGNIFICANT_REGRESSION:
-            return True
-    return False
-
-
-class CapabilityRecords(NamedTuple):
-    name: CapabilityName
-    test_records: Dict[TestId, TestRecord]
-
-    def has_regressed(self, conclusions: Dict[TestId, Conclusion]) -> bool:
-        return has_regression(self.test_records.values(), conclusions=conclusions)
-
-    def register_test_record(self, test_record: TestRecord):
-        self.test_records[test_record.test_id] = test_record
-
-
-ByCapability = Dict[CapabilityName, CapabilityRecords]
-
-
-class ComponentRecords(NamedTuple):
-    name: ComponentName
-    test_records: Dict[TestId, TestRecord]
-    capabilities: ByCapability
-
-    def has_regressed(self, conclusions: Dict[TestId, Conclusion]) -> bool:
-        return has_regression(self.test_records.values(), conclusions=conclusions)
-
-    def register_test_record(self, test_record: TestRecord):
-        self.test_records[test_record.test_id] = test_record
-
-    def register_test_record_capability(self, capability_name: CapabilityName, test_record: TestRecord):
-        if capability_name not in self.capabilities:
-            self.capabilities[capability_name] = CapabilityRecords(capability_name, dict())
-        self.capabilities[capability_name].test_records[test_record.test_id] = test_record
-
-
-ById = Dict[TestId, TestRecord]
-ByComponent = Dict[ComponentName, ComponentRecords]
+ProwjobName = str
 
 
 def index(request):
     return render(request, "main/index.html")
 
 
-component_pattern = re.compile(r'\[[^\\]+?\]')
-
-
-def categorize(rows) -> Dict[Nurp, Tuple[ById, ByComponent]]:
-    nurps: Dict[Nurp, Tuple[ById, ByComponent]] = dict()
-
-    for row in rows:
-        nurp_name = row['nurp']
-        if nurp_name is None:
-            nurp_name = 'Unknown'
-
-        if nurp_name not in nurps:
-            by_id: ById = dict()
-            by_component: ByComponent = dict()
-            nurps[nurp_name] = (by_id, by_component)
-        else:
-            by_id, by_component = nurps[nurp_name]
-
-        if row['success_count'] is None:
-            # Not sure why, but bigquery can return None for some SUMs.
-            # Potentially because success_val was not set on all original rows
-            continue
-
-        flake_count = row['flake_count']
-        success_count = row['success_count']
-        # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
-        # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
-        # failure) is included. This could make total_count - flake_count a negative value.
-        total_count = max(success_count, row['total_count'] - flake_count)
-
-        r = TestRecord(
-            test_id=row['test_id'],
-            test_name=row['test_name'],
-            success_count=success_count,
-            failure_count=total_count - success_count,
-            total_count=total_count,
-            flake_count=flake_count
-        )
-        by_id[r.test_id] = r
-        labels = re.findall(component_pattern, r.test_name)
-        for label in labels:
-            if label not in by_component:
-                by_component[label] = ComponentRecords(name=label, test_records=dict(), capabilities=dict())
-            by_component[label].register_test_record(r)
-
-            capability = r.test_id[:1]
-            by_component[label].register_test_record_capability(capability, r)
-
-    return nurps
-
-
-def calculate_conclusions(basis_nurps: Dict[Nurp, Tuple[ById, ByComponent]], sample_nurps: Dict[Nurp, Tuple[ById, ByComponent]]) -> ConclusionMap:
-    conclusions_map: ConclusionMap = dict()
-    for nurp_name in sample_nurps:
-        basis_by_id, _ = basis_nurps.get(nurp_name, (dict(), dict()))
-        samples_by_id, _ = sample_nurps[nurp_name]
-        by_conclusion: Dict[TestId, Conclusion] = dict()
-        conclusions_map[nurp_name] = by_conclusion
-
-        for test_id, sample_result in samples_by_id.items():
-            basis_result = basis_by_id.get(test_id, None)
-            if not basis_result or basis_result.total_count == 0:
-                by_conclusion[test_id] = Conclusion.MISSING_IN_BASIS
-                continue
-
-            basis_pass_percentage = basis_result.success_count / basis_result.total_count
-            sample_pass_percentage = sample_result.success_count / sample_result.total_count
-            improved = sample_pass_percentage >= basis_pass_percentage
-
-            significant = fisher_significant(
-                sample_result.failure_count,
-                sample_result.success_count,
-                basis_result.failure_count,
-                basis_result.success_count,
-            )
-
-            if significant:
-                by_conclusion[test_id] = Conclusion.SIGNIFICANT_IMPROVEMENT if improved else Conclusion.SIGNIFICANT_REGRESSION
-
-    return conclusions_map
-
-
 class ImageColumnLink(NamedTuple):
     image_path: str
+    title: Optional[str] = None
     height: Optional[int] = None
     width: Optional[int] = None
     href: Optional[str] = None
     href_params: Optional[Dict[str, str]] = None
+
+
+class AssessmentImageColumnLink:
+    def __init__(self, assessment: TestRecordAssessment, href: str = '/main/report', href_params: Dict[str, str] = None):
+        self.image_path = f'main/{assessment.image_path}'
+        self.height = 16
+        self.width = 16
+        self.href = href
+        self.href_params = href_params
+        self.title = assessment.description
 
 
 class ImageColumn(tables.Column):
@@ -249,7 +53,11 @@ class ImageColumn(tables.Column):
         if value.width:
             width_attr = f'width="{value.height}" '
 
-        content = f'<img {height_attr}{width_attr} src="/static/{image_path}"></img>'
+        title_attr = ''
+        if value.title:
+            title_attr = f'title="{value.title}" '
+
+        content = f'<img {title_attr}{height_attr}{width_attr} src="/static/{image_path}"></img>'
         if value.href:
             content = f'<a href="{value.href}?{dict_to_params_url(value.href_params)}">{content}</a>'
         return format_html(content)
@@ -261,11 +69,37 @@ def dict_to_params_url(params):
     return '&'.join([f'{key}={value}' for key, value in params.items()])
 
 
+def _render_prowjob_rows(rows) -> str:
+    result = ''
+    char_count = 0
+    for row in rows:
+        # Some files have multiple successes and failures that are not counted as flakes.
+        # An example junit I found had a success of a specific test and then a failure
+        # of the same test which came later.
+        # ref: [sig-arch] Check if alerts are firing during or after upgrade success
+        # So each row may need to be represented by multiple characters.
+        # Use max() to provide sensible results if the time selection in the query
+        # has only selected part of a file.
+        failure_iterations = max(0, row['total_count'] - row['flake_count'] - row['success_count'])
+        flake_iterations = row['flake_count']
+        success_iterations = max(0, row['success_count'] - row['flake_count'])
+
+        char_entries: List[str] = (['S'] * success_iterations) + (['s'] * flake_iterations) + (['F'] * failure_iterations)
+        for outcome_char in char_entries:
+            result += f'<a class="outcome_{outcome_char}" href="https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/origin-ci-test/{row["file_path"]}">{outcome_char}</a> '
+            char_count += 1
+            if char_count % 20 == 0:
+                result += '<br>'
+    return format_html(result)
+
+
 class ProwjobTable(tables.Table):
     prowjob_name = tables.Column()
     basis_info = tables.Column()
+    basis_runs = tables.Column()
     sample_info = tables.Column()
-    individual_job_regression = ImageColumn()
+    sample_runs = tables.Column()
+    statistically_significant = tables.Column()
 
     class Meta:
         attrs = {"class": "paleblue"}
@@ -297,9 +131,15 @@ class AllComponentsTable(tables.Table):
             return value
 
 
+COLUMN_TEST_NAME = 'test_name'
+COLUMN_TOTAL_COUNT = 'total_count'
+COLUMN_SUCCESS_COUNT = 'success_count'
+COLUMN_FLAKE_COUNT = 'flake_count'
+
+
 def report(request):
 
-    def insufficient_sanitization(parameter_name: str, parameter_default: Optional[str]=None) -> Optional[str]:
+    def insufficient_sanitization(parameter_name: str, parameter_default: Optional[str] = None) -> Optional[str]:
         val = request.GET.get(parameter_name, parameter_default)
         if val is not None and ("'" in val or '"' in val or '\\' in val):
             raise IOError('Sanitization failure')
@@ -313,37 +153,142 @@ def report(request):
     sample_start_dt = insufficient_sanitization('sample_start_dt')
     sample_end_dt = insufficient_sanitization('sample_end_dt')
 
+    confidence_param = insufficient_sanitization("confidence", "95")
+    fisher_alpha: float = (100 - int(confidence_param)) / 100
+
+    missing_samples_param = insufficient_sanitization("missing", "ok")
+    regression_when_missing = missing_samples_param != "ok"
+
     target_component_name = insufficient_sanitization('component', None)
     target_capability_name = insufficient_sanitization('capability', None)
     target_test_id = insufficient_sanitization('test_id', None)
-    target_nurp_name = insufficient_sanitization('nurp', None)
+    target_test_uuid = insufficient_sanitization('test_uuid', None)
+    target_platform_name = insufficient_sanitization('platform', None)
+    target_upgrade_name = insufficient_sanitization('upgrade', None)
+    target_arch_name = insufficient_sanitization('arch', None)
+    target_network_name = insufficient_sanitization('network', None)
+    target_environment_name = insufficient_sanitization('environment', None)
 
-    target_nurp_filter = ''
-    if target_nurp_name:
-        target_nurp_filter = f'AND CONCAT(network, " ", upgrade, " ", arch, " ", platform) = "{target_nurp_name}" '
+    group_by_param = insufficient_sanitization('group_by', None)
 
-    target_test_filter = ''
+    exclude_platforms_param = insufficient_sanitization('exclude_platforms', None)
+    exclude_arches_param = insufficient_sanitization('exclude_arches', None)
+    exclude_networks_param = insufficient_sanitization('exclude_networks', None)
+    exclude_upgrades_param = insufficient_sanitization('exclude_upgrades', None)
+
+    j = Junit
+    pqb = select(
+        j.network,
+        j.upgrade,
+        j.arch,
+        j.platform,
+        j.test_id,
+        any_value(j.test_name).label(COLUMN_TEST_NAME),
+        count(j.test_id).label(COLUMN_TOTAL_COUNT),
+        sum(j.success_val).label(COLUMN_SUCCESS_COUNT),
+        sum(j.flake_count).label(COLUMN_FLAKE_COUNT),
+    ).group_by(
+        j.network,
+        j.upgrade,
+        j.arch,
+        j.platform,
+        j.test_id,
+    )
+
+    def assert_all_set(lt: Iterable, error_msg: str):
+        if not all(lt):
+            raise ValueError(error_msg)
+
+    assert_all_set((basis_start_dt, basis_end_dt, basis_release), 'At least one basis coordinate has not been specified')
+
+    assert_all_set((sample_start_dt, sample_end_dt, sample_release), 'At least one sample coordinate has not been specified')
+
+    if target_upgrade_name:
+        pqb = pqb.filter(
+            j.upgrade == target_upgrade_name
+        )
+
+    if target_arch_name:
+        pqb = pqb.filter(
+            j.arch == target_arch_name
+        )
+
+    if target_network_name:
+        pqb = pqb.filter(
+            j.network == target_network_name
+        )
+
+    if target_platform_name:
+        pqb = pqb.filter(
+            j.platform == target_platform_name
+        )
+
     if target_test_id:
-        target_test_filter = f'AND test_id = "{target_test_id}" '
+        pqb = pqb.filter(
+            j.test_id == target_test_id
+        )
 
-    bq = bigquery.Client()
-    q = f'''
-        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
-        FROM `openshift-gce-devel.ci_analysis_us.junit` 
-        WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
-              AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
-    '''
-    basis_rows = bq.query(q)
+    if exclude_platforms_param:
+        for exclude_prefix in exclude_platforms_param.split(','):
+            if not exclude_prefix:
+                continue
+            pqb = pqb.filter(
+                j.platform.notlike(f'{exclude_prefix}%')
+            )
 
-    q = f'''
-        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
-        FROM `openshift-gce-devel.ci_analysis_us.junit` 
-        WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
-              AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
-    '''
+    if exclude_arches_param:
+        for exclude_name in exclude_arches_param.split(','):
+            if not exclude_name:
+                continue
+            pqb = pqb.filter(
+                j.arch != exclude_name
+            )
 
-    sample_rows = bq.query(q)
+    if exclude_networks_param:
+        for exclude_name in exclude_networks_param.split(','):
+            if not exclude_name:
+                continue
+            pqb = pqb.filter(
+                j.network != exclude_name
+            )
 
+    if exclude_upgrades_param:
+        upgrade_name_db_mapping = {
+            'install': '',
+            'minor': 'upgrade-minor',
+            'micro': 'upgrade-micro',
+        }
+        for exclude_name in exclude_upgrades_param.split(','):
+            if not exclude_name or exclude_name not in upgrade_name_db_mapping:
+                continue
+            pqb = pqb.filter(
+                j.upgrade != upgrade_name_db_mapping[exclude_name]
+            )
+
+    # q = f'''
+    #     SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
+    #     FROM `openshift-gce-devel.ci_analysis_us.junit`
+    #     WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
+    #           AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id
+    # '''
+    basis_query = pqb.filter(
+        j.modified_time >= j.format_modified_time(basis_start_dt),
+        j.modified_time < j.format_modified_time(basis_end_dt),
+        j.branch == basis_release
+    )
+
+    # q = f'''
+    #     SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
+    #     FROM `openshift-gce-devel.ci_analysis_us.junit`
+    #     WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
+    #           AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id
+    # '''
+
+    sample_query = pqb.filter(
+        j.modified_time >= j.format_modified_time(sample_start_dt),
+        j.modified_time < j.format_modified_time(sample_end_dt),
+        j.branch == sample_release
+    )
 
     # Performance note: the .query() calls return relatively quickly. Bigquery is doing the calculations
     # and python will only block when you try to read rows that haven't been calculated yet.
@@ -355,12 +300,15 @@ def report(request):
     # waiting for bigquery).
 
     executor = ThreadPoolExecutor(2)
-    basis_future = executor.submit(categorize, (basis_rows))
-    sample_future = executor.submit(categorize, (sample_rows))
-    basis_nurps = basis_future.result()
-    sample_nurps = sample_future.result()
+    basis_environment_model = EnvironmentModel()
+    sample_environment_model = EnvironmentModel()
+    basis_future = executor.submit(basis_environment_model.read_in_query, basis_query, group_by_param)
+    sample_future = executor.submit(sample_environment_model.read_in_query, sample_query, group_by_param)
+    basis_future.result()
+    sample_future.result()
+    sample_environment_model.build_mass_assessment_cache(basis_environment_model, alpha=fisher_alpha, regression_when_missing=regression_when_missing)
 
-    conclusions_by_nurp = calculate_conclusions(basis_nurps=basis_nurps, sample_nurps=sample_nurps)
+    ordered_environment_names: List[EnvironmentName] = sorted(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names()))
 
     context = {
         'basis_release': basis_release,
@@ -369,133 +317,241 @@ def report(request):
         'sample_release': sample_release,
         'sample_start_dt': sample_start_dt,
         'sample_end_dt': sample_end_dt,
+        'group_by': group_by_param,
     }
 
-    if target_test_id:  # Rendering a specifically requested test id
-        if not target_nurp_name:
-            return HttpResponse(f'No nurp parameter was specified')
+    if target_platform_name:
+        context['platform'] = target_platform_name
+    if target_network_name:
+        context['network'] = target_network_name
+    if target_upgrade_name:
+        context['upgrade'] = target_upgrade_name
+    if target_arch_name:
+        context['arch'] = target_arch_name
 
-        samples_by_id, samples_by_component = sample_nurps[target_nurp_name]
-        basis_by_id, _ = basis_nurps[target_nurp_name]
+    if confidence_param != "95":
+        context['confidence'] = confidence_param
 
-        if target_test_id not in samples_by_id:
-            return HttpResponse(f'Target test {target_test_id} not found in nurp: {target_nurp_name}')
+    if missing_samples_param != "ok":
+        context['missing'] = missing_samples_param
 
-        sample_test_record = samples_by_id[target_test_id]
-        basis_test_record = basis_by_id.get(target_test_id, TestRecord(test_name='', total_count=0, success_count=0, failure_count=0, test_id=target_test_id, flake_count=0))
+    def populate_environment_link_context(environment_test_records: EnvironmentTestRecords, link_context: Dict):
+        if environment_test_records.platform:
+            link_context['platform'] = environment_test_records.platform
+        if environment_test_records.network:
+            link_context['network'] = environment_test_records.network
+        if environment_test_records.upgrade:
+            link_context['upgrade'] = environment_test_records.upgrade
+        if environment_test_records.arch:
+            link_context['arch'] = environment_test_records.arch
+
+    if target_test_id:  # Rendering a specifically requested TestRecordSet test_id
+        if not target_environment_name:
+            return HttpResponse(f'No environment parameter was specified')
+        if not target_component_name:
+            return HttpResponse(f'No component parameter was specified')
+        if not target_capability_name:
+            return HttpResponse(f'No capability parameter was specified')
+
+        sample_test_record_set = sample_environment_model.get_environment_test_records(target_environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_set(target_test_id)
+        context['environment'] = target_environment_name
+        context['component'] = target_component_name
+        context['capability'] = target_capability_name
+        context['test_id'] = target_test_id
+
+        uuid_count = len(sample_test_record_set.test_records)
+        if uuid_count > 1:
+            # There are more than one test uuids that have been grouped into this test record set,
+            # so provide a UI that allows the user to view each UUID and drill to the one they
+            # want more information for.
+
+            test_record_summary: List[Dict] = list()
+            extra_columns = [
+                ('platform', tables.Column()),
+                ('arch', tables.Column()),
+                ('network', tables.Column()),
+                ('upgrade', tables.Column()),
+                ('status', ImageColumn())
+            ]
+
+            for test_record in sorted(sample_test_record_set.get_test_records(), key=lambda x: x.test_uuid):
+
+                env_attributes: Dict = {
+                    'platform': test_record.platform,
+                    'arch': test_record.arch,
+                    'network': test_record.network,
+                    'upgrade': test_record.upgrade,
+                }
+                href_params = dict(context)
+                href_params.update(env_attributes)
+                href_params['test_uuid'] = test_record.test_uuid
+
+                row = {
+                    'name': test_record.test_name,
+                    'status': AssessmentImageColumnLink(
+                        test_record.cached_assessment,
+                        href_params=dict(href_params)
+                    )
+                }
+                row.update(env_attributes)
+
+                test_record_summary.append(row)
+
+            table = AllComponentsTable(test_record_summary,
+                                       extra_columns=extra_columns,
+                                       )
+            context['table'] = table
+            context['breadcrumb'] = f'{target_environment_name} > {target_component_name} > {target_capability_name} > Disambiguate'
+            return render(request, 'main/report-table.html', context)
+
+        elif uuid_count == 1:
+            # There is only one test uuid associated with this test record set. Send the user
+            # straight to the UI for the specific uuid.
+            target_test_uuid = sample_test_record_set.get_test_record_uuids()[0]
+        else:
+            return HttpResponse('No tests are associated with this environment and test id')
+
+    if target_test_uuid:
+        if not target_environment_name:
+            return HttpResponse(f'No environment parameter was specified')
+        if not target_component_name:
+            return HttpResponse(f'No component parameter was specified')
+        if not target_capability_name:
+            return HttpResponse(f'No capability parameter was specified')
+        if not target_test_id:
+            return HttpResponse(f'No test_id parameter was specified')
+
+        sample_test_record_set = sample_environment_model.get_environment_test_records(
+            target_environment_name).get_component_test_records(target_component_name).get_capability_test_records(
+            target_capability_name).get_test_record_set(target_test_id)
+        sample_test_record = sample_test_record_set.get_test_record(target_test_uuid)
+
+        if not sample_test_record:
+            return HttpResponse('No sample test record found for test uuid')
+
+        basis_test_record_set = basis_environment_model.get_environment_test_records(
+            target_environment_name).get_component_test_records(target_component_name).get_capability_test_records(
+            target_capability_name).get_test_record_set(target_test_id)
+
+        basis_test_record = basis_test_record_set.get_test_record(target_test_uuid)
+
+        if not basis_test_record:
+            basis_test_record = TestRecord(
+                platform=sample_test_record.platform,
+                network=sample_test_record.network,
+                upgrade=sample_test_record.upgrade,
+                arch=sample_test_record.arch,
+                test_id=sample_test_record.test_id,
+                test_name=sample_test_record.test_name
+            )
+
         context['sample_test'] = sample_test_record
         context['basis_test'] = basis_test_record
         context['fishers_exact'] = str(fast_fisher.fast_fisher_cython.fisher_exact(
             sample_test_record.failure_count, sample_test_record.success_count,
             basis_test_record.failure_count, basis_test_record.success_count,
-            alternative='greater'
+            alternative='greater' if sample_test_record.assessment() != TestRecordAssessment.SIGNIFICANT_IMPROVEMENT else 'less'
         ))
 
-        q = f'''
-            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count 
-            FROM `openshift-gce-devel.ci_analysis_us.junit` 
-            WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
-                  AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, prowjob_name        
-        '''
-        basis_prowjob_runs_rows = bq.query(q)
+        base_test_query = select(
+            j.file_path,
+            any_value(j.prowjob_name).label('prowjob_name'),
+            sum(j.success_val).label('success_count'),
+            sum(j.flake_count).label('flake_count'),
+            count('*').label('total_count'),  # Including flakes
+        ).where(
+            j.platform == sample_test_record.platform,
+            j.network == sample_test_record.network,
+            j.upgrade == sample_test_record.upgrade,
+            j.arch == sample_test_record.arch,
+            j.test_id == sample_test_record.test_id
+        ).group_by(
+            j.file_path,
+            j.modified_time
+        ).order_by(
+            j.modified_time  # Show test runs in roughly chronological order
+        )
 
-        q = f'''
-            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
-            FROM `openshift-gce-devel.ci_analysis_us.junit` 
-            WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
-                  AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, prowjob_name        
-        '''
+        basis_test_query = base_test_query.where(
+            j.modified_time >= j.format_modified_time(basis_start_dt),
+            j.modified_time < j.format_modified_time(basis_end_dt),
+            j.branch == basis_release
+        )
 
-        sample_prowjob_runs_rows = bq.query(q)
+        sample_test_query = base_test_query.where(
+            j.modified_time >= j.format_modified_time(sample_start_dt),
+            j.modified_time < j.format_modified_time(sample_end_dt),
+            j.branch == sample_release
+        )
 
         # Aggregate test successes/failures by prowjob
         prowjob_names = set()
-        basis_prowjob_runs: Dict[str, TestRecord] = dict()
-        for row in basis_prowjob_runs_rows:
+
+        basis_prowjob_runs: Dict[ProwjobName, List] = dict()
+        for row in basis_test_query.execute():
             prowjob_name: str = row['prowjob_name']
             prowjob_name = prowjob_name.replace(basis_release, 'X.X')  # Strip release specific information from prowjob name
             prowjob_names.add(prowjob_name)
-            flake_count = row['flake_count']
-            success_count = row['success_count']
-            # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
-            # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
-            # failure) is included. This could make total_count - flake_count a negative value.
-            total_count = max(success_count, row['total_count'] - flake_count)
-            basis_prowjob_runs[prowjob_name] = TestRecord(
-                test_id=target_test_id,
-                test_name=None,
-                success_count=success_count,
-                total_count=total_count,
-                failure_count=total_count - success_count,
-                flake_count=flake_count,
-            )
+            if prowjob_name not in basis_prowjob_runs:
+                basis_prowjob_runs[prowjob_name] = list()
+            basis_prowjob_runs[prowjob_name].append(row)
 
-        sample_prowjob_runs: Dict[str, TestRecord] = dict()
-        for row in sample_prowjob_runs_rows:
-            prowjob_name = row['prowjob_name']
+        sample_prowjob_runs: Dict[ProwjobName, List] = dict()
+        for row in sample_test_query.execute():
+            prowjob_name: str = row['prowjob_name']
             prowjob_name = prowjob_name.replace(sample_release, 'X.X')  # Strip release specific information from prowjob name
             prowjob_names.add(prowjob_name)
-            flake_count = row['flake_count']
-            success_count = row['success_count']
-            # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
-            # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
-            # failure) is included. This could make total_count - flake_count a negative value.
-            total_count = max(success_count, row['total_count'] - flake_count)
-            sample_prowjob_runs[prowjob_name] = TestRecord(
-                test_id=target_test_id,
-                test_name=None,
-                success_count=success_count,
-                total_count=total_count,
-                failure_count=total_count - success_count,
-                flake_count=flake_count,
-            )
+            if prowjob_name not in sample_prowjob_runs:
+                sample_prowjob_runs[prowjob_name] = list()
+            sample_prowjob_runs[prowjob_name].append(row)
 
         prowjob_analysis: List[Dict[str, str]] = list()
         for prowjob_name in sorted(prowjob_names):
-            basis_result = basis_prowjob_runs.get(prowjob_name, NO_TESTS)
-            sample_result = sample_prowjob_runs.get(prowjob_name, NO_TESTS)
 
-            if basis_result.total_count == 0 or sample_result.total_count == 0:
-                regressed = False
-            else:
-                basis_pass_percentage = basis_result.success_count / basis_result.total_count
-                sample_pass_percentage = sample_result.success_count / sample_result.total_count
-                improved = sample_pass_percentage >= basis_pass_percentage
+            basis_prowjob_rows = basis_prowjob_runs.get(prowjob_name, list())
+            basis_success_count = 0
+            basis_flake_count = 0
+            basis_total_count = 0
 
-                regressed = fisher_significant(
-                    sample_result.failure_count,
-                    sample_result.success_count,
-                    basis_result.failure_count,
-                    basis_result.success_count,
-                )
+            for basis_prowjob_row in basis_prowjob_rows:
+                basis_success_count += basis_prowjob_row['success_count']
+                basis_flake_count += basis_prowjob_row['flake_count']
+                basis_total_count += basis_prowjob_row['total_count']  # Includes flakes
+            basis_failure_count = max(0, basis_total_count-basis_flake_count-basis_success_count)
+            basis_total_minus_flakes = (basis_total_count - basis_flake_count)
+            basis_success_rate = '{:.2f}'.format(0.0 if basis_total_minus_flakes == 0 else 100 * basis_success_count / basis_total_minus_flakes)
 
-                if improved:
-                    regressed = False
+            sample_prowjob_rows = sample_prowjob_runs.get(prowjob_name, list())
+            sample_success_count = 0
+            sample_flake_count = 0
+            sample_total_count = 0
 
-            basis_success_count = basis_result.success_count
-            basis_failure_count = basis_result.failure_count
-            basis_flake_count = basis_result.flake_count
-            sample_success_count = sample_result.success_count
-            sample_failure_count = sample_result.failure_count
-            sample_flake_count = sample_result.flake_count
+            for sample_prowjob_row in sample_prowjob_rows:
+                sample_success_count += sample_prowjob_row['success_count']
+                sample_flake_count += sample_prowjob_row['flake_count']
+                sample_total_count += sample_prowjob_row['total_count']  # Includes flakes
+            sample_failure_count = max(0, sample_total_count-sample_flake_count-sample_success_count)
+            sample_total_minus_flakes = (sample_total_count - sample_flake_count)
+            sample_success_rate = '{:.2f}'.format(0.0 if sample_total_minus_flakes == 0 else 100 * sample_success_count / sample_total_minus_flakes)
 
             prowjob_analysis.append(
                 {
                     'prowjob_name': prowjob_name,
-                    'basis_info': f'successes={basis_success_count} failures={basis_failure_count} (flakes={basis_flake_count})',
-                    'sample_info': f'successes={sample_success_count} failures={sample_failure_count} (flakes={sample_flake_count})',
-                    'individual_job_regression': ImageColumnLink(
-                        image_path='/main/red.png' if regressed else '/main/green.png',
-                        height=16, width=16,
-                        href=None,
-                        href_params=dict()
-                    )
+                    'basis_info': format_html(f'rate={basis_success_rate}%<br>successes={basis_success_count}<br>failures={basis_failure_count}<br>flakes={basis_flake_count}'),
+                    'basis_runs': _render_prowjob_rows(basis_prowjob_rows),
+                    'sample_info': format_html(f'rate={sample_success_rate}%<br>successes={sample_success_count}<br>failures={sample_failure_count}<br>flakes={sample_flake_count}'),
+                    'sample_runs': _render_prowjob_rows(sample_prowjob_rows),
+                    'statistically_significant': fisher_significant(
+                        sample_failure_count, sample_success_count,
+                        basis_failure_count, basis_success_count,
+                        alpha=fisher_alpha,
+                    ),
                 }
             )
 
         prowjob_table = ProwjobTable(data=prowjob_analysis)
         context['table'] = prowjob_table
-        context['breadcrumb'] = f'{target_nurp_name} > {target_component_name} > {target_capability_name} > {sample_test_record.test_name}'
+        context['breadcrumb'] = f'{target_environment_name} > {target_component_name} > {target_capability_name} > {sample_test_record.test_name}'
         return render(request, 'main/report-test.html', context)
 
     if not target_component_name:  # Rendering all components
@@ -503,12 +559,12 @@ def report(request):
         extra_columns = []
         all_component_names = set()
 
-        for nurp_name in sorted(conclusions_by_nurp.keys()):
+        for environment_name in ordered_environment_names:
             image_href_params = dict(context)
-            image_href_params['nurp'] = nurp_name
-            extra_columns.append((nurp_name, ImageColumn()))
-            _, by_component = sample_nurps[nurp_name]
-            all_component_names.update(by_component.keys())
+            image_href_params['environment'] = environment_name
+            extra_columns.append((environment_name, ImageColumn()))
+            sample_environment_test_records = sample_environment_model.get_environment_test_records(environment_name)
+            all_component_names.update(sample_environment_test_records.get_component_names())
 
         for component_name in sorted(list(all_component_names)):
             if 'sig' not in component_name:
@@ -518,21 +574,19 @@ def report(request):
                 'name': component_name,
             }
 
-            for nurp_name in sample_nurps:
-                _, samples_by_component = sample_nurps[nurp_name]
-                if component_name in samples_by_component:
-                    regressed = samples_by_component[component_name].has_regressed(conclusions_by_nurp[nurp_name])
-                else:
-                    regressed = False
+            for environment_name in ordered_environment_names:
+                sample_environment_test_records: EnvironmentTestRecords = sample_environment_model.get_environment_test_records(environment_name)
+                sample_component_test_records = sample_environment_test_records.get_component_test_records(component_name)
+
+                component_assessment: TestRecordAssessment = sample_component_test_records.assessment()
 
                 href_params = dict(context)
                 href_params['component'] = component_name
-                href_params['nurp'] = nurp_name
+                href_params['environment'] = environment_name
+                populate_environment_link_context(sample_environment_test_records, href_params)
 
-                row[nurp_name] = ImageColumnLink(
-                    image_path='/main/red.png' if regressed else '/main/green.png',
-                    height=16, width=16,
-                    href='/main/report',
+                row[environment_name] = AssessmentImageColumnLink(
+                    component_assessment,
                     href_params=dict(href_params)
                 )
 
@@ -550,35 +604,41 @@ def report(request):
 
         context['component'] = target_component_name
 
-        if not target_nurp_name:  # Rendering a component or capability with nurps as column heading
+        if not target_environment_name:  # Rendering a component or capability with environments as column heading
 
             if target_capability_name:
                 extra_columns = []
 
-                for nurp_name in sorted(conclusions_by_nurp.keys()):
+                test_id_lookup: Dict[TestName, TestId] = dict()
+                for environment_name in sample_environment_model.get_ordered_environment_names():
                     image_href_params = dict(context)
-                    image_href_params['nurp'] = nurp_name
-                    extra_columns.append((nurp_name, ImageColumn()))
-                    _, by_component = sample_nurps[nurp_name]
+                    image_href_params['environment'] = environment_name
+                    extra_columns.append((environment_name, ImageColumn()))
+
+                    # It's unlikely but possible that a component in one environment has different capabilities
+                    # than a component in another environment. Build a full set of names across environments.
+                    for sample_test_record_set in sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_sets():
+                        test_id_lookup[sample_test_record_set.canonical_test_name] = sample_test_record_set.test_id
 
                 test_summary: List[Dict] = list()
 
-                for test_id, test_record in by_component[target_component_name].capabilities[target_capability_name].test_records.items():
+                for test_name in sorted(list(test_id_lookup.keys())):
+                    test_record_set_test_id = test_id_lookup[test_name]
 
                     row = {
-                        'name': test_record.test_name,
+                        'name': test_name,
                     }
 
-                    for nurp_name in sample_nurps:
-                        regressed = has_regression([test_record], conclusions=conclusions_by_nurp[nurp_name])
+                    for environment_name in sample_environment_model.get_ordered_environment_names():
+                        sample_environment_test_records = sample_environment_model.get_environment_test_records(environment_name)
+                        assessment: TestRecordAssessment = sample_environment_test_records.get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_set(test_record_set_test_id).assessment()
                         href_params = dict(context)
                         href_params['capability'] = target_capability_name
-                        href_params['test_id'] = test_id
-                        href_params['nurp'] = nurp_name
-                        row[nurp_name] = ImageColumnLink(
-                            image_path='/main/red.png' if regressed else '/main/green.png',
-                            height=16, width=16,
-                            href='/main/report',
+                        href_params['test_id'] = test_record_set_test_id
+                        href_params['environment'] = environment_name
+                        populate_environment_link_context(sample_environment_test_records, href_params)
+                        row[environment_name] = AssessmentImageColumnLink(
+                            assessment,
                             href_params=href_params,
                         )
 
@@ -591,32 +651,38 @@ def report(request):
                 context['breadcrumb'] = f'{target_component_name} > {target_capability_name}'
                 return render(request, 'main/report-table.html', context)
 
-            else:
+            else:  # Rending the capabilities of a component vs environment columns
                 extra_columns = []
 
-                for nurp_name in sorted(conclusions_by_nurp.keys()):
+                # It's remote, but possible that the same component within different
+                # environments have different capabilities. Develop a
+                # set of all names across each environment.
+                capability_names: Set[str] = set()
+
+                for environment_name in sample_environment_model.get_ordered_environment_names():
                     image_href_params = dict(context)
-                    image_href_params['nurp'] = nurp_name
-                    extra_columns.append((nurp_name, ImageColumn()))
-                    _, by_component = sample_nurps[nurp_name]
+                    image_href_params['environment'] = environment_name
+                    extra_columns.append((environment_name, ImageColumn()))
+                    capability_names.update(
+                        sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_names()
+                    )
 
                 capability_summary: List[Dict] = list()
-
-                for capability_name, capability_record in by_component[target_component_name].capabilities.items():
+                for capability_name in sorted(capability_names):
 
                     row = {
                         'name': capability_name,
                     }
 
-                    for nurp_name in sample_nurps:
-                        regressed = capability_record.has_regressed(conclusions_by_nurp[nurp_name])
+                    for environment_name in ordered_environment_names:
+                        sample_environment_test_records = sample_environment_model.get_environment_test_records(environment_name)
+                        assessment = sample_environment_test_records.get_component_test_records(target_component_name).get_capability_test_records(capability_name).assessment()
                         href_params = dict(context)
                         href_params['capability'] = capability_name
-                        href_params['nurp'] = nurp_name
-                        row[nurp_name] = ImageColumnLink(
-                            image_path='/main/red.png' if regressed else '/main/green.png',
-                            height=16, width=16,
-                            href='/main/report',
+                        href_params['environment'] = environment_name
+                        populate_environment_link_context(sample_environment_test_records, href_params)
+                        row[environment_name] = AssessmentImageColumnLink(
+                            assessment,
                             href_params=href_params,
                         )
 
@@ -631,56 +697,50 @@ def report(request):
                 context['breadcrumb'] = f'{target_component_name}'
                 return render(request, 'main/report-table.html', context)
 
-        else:
-            samples_by_id, samples_by_component = sample_nurps[target_nurp_name]
-            if target_component_name and target_component_name not in samples_by_component:
-                return HttpResponse(f'Component not found: {target_component_name}')
+        else:  # Showing capabilities for specific component in specific environment
+            context['environment'] = target_environment_name
+            sample_environment_test_records = sample_environment_model.get_environment_test_records(target_environment_name)
+            sample_component_test_records = sample_environment_test_records.get_component_test_records(target_component_name)
 
-            context['nurp'] = target_nurp_name
-            if not target_capability_name:
+            if not target_capability_name:  # Show capabilities of a specific component in a specific environment
                 capability_summary: List[Dict] = list()
-                component_records = samples_by_component[target_component_name]
-                for capability_name in sorted(component_records.capabilities.keys()):
-                    regressed = component_records.capabilities[capability_name].has_regressed(conclusions_by_nurp[target_nurp_name])
+                for capability_name in sorted(sample_component_test_records.get_capability_names()):
+                    sample_capability_test_records = sample_component_test_records.get_capability_test_records(capability_name)
+                    assessment = sample_capability_test_records.assessment()
                     href_params = dict(context)
                     href_params['capability'] = capability_name
+                    populate_environment_link_context(sample_environment_test_records, href_params)
                     capability_summary.append({
                         'name': capability_name,
-                        'status': ImageColumnLink(
-                            image_path='/main/red.png' if regressed else '/main/green.png',
-                            height=16, width=16,
-                            href='/main/report',
+                        'status': AssessmentImageColumnLink(
+                            assessment,
                             href_params=href_params,
                         )
                     })
 
                 table = AllComponentsTable(capability_summary, extra_columns=[('status', ImageColumn())])
                 context['table'] = table
-                context['breadcrumb'] = f'{target_nurp_name} > {target_component_name}'
+                context['breadcrumb'] = f'{target_environment_name} > {target_component_name}'
                 return render(request, 'main/report-table.html', context)
-            else:  # Rendering the capabilities of a specific component
+            else:  # Show tests of a specific capability in a specific environment
                 test_summary: List[Dict] = list()
                 context['capability'] = target_capability_name
-                component_records = samples_by_component[target_component_name]
-                if target_capability_name not in component_records.capabilities:
-                    return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
+                capability_test_records = sample_component_test_records.get_capability_test_records(target_capability_name)
 
-                capability_records = component_records.capabilities[target_capability_name]
-                for tr in sorted(list(capability_records.test_records.values()), key=lambda x: x.test_name):
-                    regressed = has_regression([tr], conclusions_by_nurp[target_nurp_name])
+                for test_record_set in sorted(list(capability_test_records.get_test_record_sets()), key=lambda x: x.canonical_test_name):
+                    assessment = test_record_set.assessment()
                     href_params = dict(context)
-                    href_params['test_id'] = tr.test_id
+                    href_params['test_id'] = test_record_set.test_id
+                    populate_environment_link_context(sample_environment_test_records, href_params)
                     test_summary.append({
-                        'name': tr.test_name,
-                        'status': ImageColumnLink(
-                            image_path='/main/red.png' if regressed else '/main/green.png',
-                            height=16, width=16,
-                            href='/main/report',
+                        'name': test_record_set.canonical_test_name,
+                        'status': AssessmentImageColumnLink(
+                            assessment,
                             href_params=href_params,
                         )
                     })
 
                 table = AllComponentsTable(test_summary, extra_columns=[('status', ImageColumn())])
                 context['table'] = table
-                context['breadcrumb'] = f'{target_nurp_name} > {target_component_name} > {target_capability_name}'
+                context['breadcrumb'] = f'{target_environment_name} > {target_component_name} > {target_capability_name}'
                 return render(request, 'main/report-table.html', context)

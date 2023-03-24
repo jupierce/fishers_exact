@@ -1,7 +1,6 @@
 import re
 import math
 import mmap
-import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 
@@ -12,6 +11,8 @@ from django.utils.html import format_html
 from django.http import HttpResponse
 import django_tables2 as tables
 
+from .bq_junit import Junit, select, sum, count, any_value
+
 import fast_fisher.fast_fisher_cython
 
 from django.shortcuts import render
@@ -20,7 +21,7 @@ from readiness.settings import BASE_DIR
 from google.cloud import bigquery
 
 
-Nurp = str
+EnvironmentKey = str
 TestId = str
 ComponentName = str
 CapabilityName = str
@@ -91,7 +92,7 @@ class Conclusion(Enum):
     SIGNIFICANT_REGRESSION = 3
 
 
-ConclusionMap = Dict[Nurp, Dict[TestId, Conclusion]]
+ConclusionMap = Dict[EnvironmentKey, Dict[TestId, Conclusion]]
 
 
 def has_regression(records: Iterable[TestRecord], conclusions: Dict[TestId, Conclusion]) -> bool:
@@ -149,36 +150,34 @@ def index(request):
 component_pattern = re.compile(r'\[[^\\]+?\]')
 
 
-def categorize(rows) -> Dict[Nurp, Tuple[ById, ByComponent]]:
-    nurps: Dict[Nurp, Tuple[ById, ByComponent]] = dict()
+def categorize(sql_query) -> Dict[EnvironmentKey, Tuple[ById, ByComponent]]:
+    environments: Dict[EnvironmentKey, Tuple[ById, ByComponent]] = dict()
 
-    for row in rows:
-        nurp_name = row['nurp']
-        if nurp_name is None:
-            nurp_name = 'Unknown'
+    for row in sql_query.execute():
+        environment_name = ' '.join((row.network, row.upgrade, row.arch, row.platform))
 
-        if nurp_name not in nurps:
+        if environment_name not in environments:
             by_id: ById = dict()
             by_component: ByComponent = dict()
-            nurps[nurp_name] = (by_id, by_component)
+            environments[environment_name] = (by_id, by_component)
         else:
-            by_id, by_component = nurps[nurp_name]
+            by_id, by_component = environments[environment_name]
 
-        if row['success_count'] is None:
+        if row.success_count is None:
             # Not sure why, but bigquery can return None for some SUMs.
             # Potentially because success_val was not set on all original rows
             continue
 
-        flake_count = row['flake_count']
-        success_count = row['success_count']
+        flake_count = row.flake_count
+        success_count = row.success_count
         # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
         # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
         # failure) is included. This could make total_count - flake_count a negative value.
-        total_count = max(success_count, row['total_count'] - flake_count)
+        total_count = max(success_count, row.total_count - flake_count)
 
         r = TestRecord(
-            test_id=row['test_id'],
-            test_name=row['test_name'],
+            test_id=row.test_id,
+            test_name=row.test_name,
             success_count=success_count,
             failure_count=total_count - success_count,
             total_count=total_count,
@@ -194,14 +193,14 @@ def categorize(rows) -> Dict[Nurp, Tuple[ById, ByComponent]]:
             capability = r.test_id[:1]
             by_component[label].register_test_record_capability(capability, r)
 
-    return nurps
+    return environments
 
 
-def calculate_conclusions(basis_nurps: Dict[Nurp, Tuple[ById, ByComponent]], sample_nurps: Dict[Nurp, Tuple[ById, ByComponent]]) -> ConclusionMap:
+def calculate_conclusions(basis_envs: Dict[EnvironmentKey, Tuple[ById, ByComponent]], sample_envs: Dict[EnvironmentKey, Tuple[ById, ByComponent]]) -> ConclusionMap:
     conclusions_map: ConclusionMap = dict()
-    for nurp_name in sample_nurps:
-        basis_by_id, _ = basis_nurps.get(nurp_name, (dict(), dict()))
-        samples_by_id, _ = sample_nurps[nurp_name]
+    for nurp_name in sample_envs:
+        basis_by_id, _ = basis_envs.get(nurp_name, (dict(), dict()))
+        samples_by_id, _ = sample_envs[nurp_name]
         by_conclusion: Dict[TestId, Conclusion] = dict()
         conclusions_map[nurp_name] = by_conclusion
 
@@ -297,6 +296,12 @@ class AllComponentsTable(tables.Table):
             return value
 
 
+COLUMN_TEST_NAME = 'test_name'
+COLUMN_TOTAL_COUNT = 'total_count'
+COLUMN_SUCCESS_COUNT = 'success_count'
+COLUMN_FLAKE_COUNT = 'flake_count'
+
+
 def report(request):
 
     def insufficient_sanitization(parameter_name: str, parameter_default: Optional[str]=None) -> Optional[str]:
@@ -316,34 +321,77 @@ def report(request):
     target_component_name = insufficient_sanitization('component', None)
     target_capability_name = insufficient_sanitization('capability', None)
     target_test_id = insufficient_sanitization('test_id', None)
-    target_nurp_name = insufficient_sanitization('nurp', None)
+    target_platform_name = insufficient_sanitization('platform', None)
+    target_upgrade_name = insufficient_sanitization('upgrade', None)
+    target_arch_name = insufficient_sanitization('arch', None)
+    target_network_name = insufficient_sanitization('network', None)
 
-    target_nurp_filter = ''
-    if target_nurp_name:
-        target_nurp_filter = f'AND CONCAT(network, " ", upgrade, " ", arch, " ", platform) = "{target_nurp_name}" '
+    j = Junit
+    pqb = select(
+        j.network,
+        j.upgrade,
+        j.arch,
+        j.platform,
+        j.test_id,
+        any_value(j.test_name).label(COLUMN_TEST_NAME),
+        count(j.test_id).label(COLUMN_TOTAL_COUNT),
+        sum(j.success_val).label(COLUMN_SUCCESS_COUNT),
+        sum(j.flake_count).label(COLUMN_FLAKE_COUNT),
+    ).group_by(
+        j.network,
+        j.upgrade,
+        j.arch,
+        j.platform,
+        j.test_id,
+    )
 
-    target_test_filter = ''
-    if target_test_id:
-        target_test_filter = f'AND test_id = "{target_test_id}" '
+    def assert_all_set(lt: Iterable, error_msg: str):
+        if not all(lt):
+            raise ValueError(error_msg)
 
-    bq = bigquery.Client()
-    q = f'''
-        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
-        FROM `openshift-gce-devel.ci_analysis_us.junit` 
-        WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
-              AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
-    '''
-    basis_rows = bq.query(q)
+    assert_all_set((basis_start_dt, basis_end_dt, basis_release), 'At least one basis coordinate has not been specified')
 
-    q = f'''
-        SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
-        FROM `openshift-gce-devel.ci_analysis_us.junit` 
-        WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
-              AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id        
-    '''
+    assert_all_set((sample_start_dt, sample_end_dt, sample_release), 'At least one sample coordinate has not been specified')
 
-    sample_rows = bq.query(q)
+    if any((target_network_name, target_upgrade_name, target_arch_name, target_platform_name, target_test_id)):
+        assert_all_set((target_network_name, target_upgrade_name, target_arch_name, target_platform_name), 'Elements of primary drill key were not specified')
 
+        pqb = pqb.filter(
+            j.network == target_network_name,
+            j.upgrade == target_upgrade_name,
+            j.arch == target_arch_name,
+            j.platform == target_platform_name,
+        )
+
+        if target_test_id:
+            pqb = pqb.filter(
+                j.test_id == target_test_id
+            )
+
+    # q = f'''
+    #     SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
+    #     FROM `openshift-gce-devel.ci_analysis_us.junit`
+    #     WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
+    #           AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id
+    # '''
+    basis_query = pqb.filter(
+        j.modified_time >= j.format_modified_time(basis_start_dt),
+        j.modified_time < j.format_modified_time(basis_end_dt),
+        j.branch == basis_release
+    )
+
+    # q = f'''
+    #     SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
+    #     FROM `openshift-gce-devel.ci_analysis_us.junit`
+    #     WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
+    #           AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, test_id
+    # '''
+
+    sample_query = pqb.filter(
+        j.modified_time >= j.format_modified_time(sample_start_dt),
+        j.modified_time < j.format_modified_time(sample_end_dt),
+        j.branch == sample_release
+    )
 
     # Performance note: the .query() calls return relatively quickly. Bigquery is doing the calculations
     # and python will only block when you try to read rows that haven't been calculated yet.
@@ -355,12 +403,12 @@ def report(request):
     # waiting for bigquery).
 
     executor = ThreadPoolExecutor(2)
-    basis_future = executor.submit(categorize, (basis_rows))
-    sample_future = executor.submit(categorize, (sample_rows))
-    basis_nurps = basis_future.result()
-    sample_nurps = sample_future.result()
+    basis_future = executor.submit(categorize, (basis_query))
+    sample_future = executor.submit(categorize, (sample_query))
+    basis_envs = basis_future.result()
+    sample_envs = sample_future.result()
 
-    conclusions_by_nurp = calculate_conclusions(basis_nurps=basis_nurps, sample_nurps=sample_nurps)
+    conclusions_by_env = calculate_conclusions(basis_envs=basis_envs, sample_envs=sample_envs)
 
     context = {
         'basis_release': basis_release,
@@ -375,8 +423,8 @@ def report(request):
         if not target_nurp_name:
             return HttpResponse(f'No nurp parameter was specified')
 
-        samples_by_id, samples_by_component = sample_nurps[target_nurp_name]
-        basis_by_id, _ = basis_nurps[target_nurp_name]
+        samples_by_id, samples_by_component = sample_envs[target_nurp_name]
+        basis_by_id, _ = basis_envs[target_nurp_name]
 
         if target_test_id not in samples_by_id:
             return HttpResponse(f'Target test {target_test_id} not found in nurp: {target_nurp_name}')
@@ -503,11 +551,11 @@ def report(request):
         extra_columns = []
         all_component_names = set()
 
-        for nurp_name in sorted(conclusions_by_nurp.keys()):
+        for nurp_name in sorted(conclusions_by_env.keys()):
             image_href_params = dict(context)
             image_href_params['nurp'] = nurp_name
             extra_columns.append((nurp_name, ImageColumn()))
-            _, by_component = sample_nurps[nurp_name]
+            _, by_component = sample_envs[nurp_name]
             all_component_names.update(by_component.keys())
 
         for component_name in sorted(list(all_component_names)):
@@ -518,10 +566,10 @@ def report(request):
                 'name': component_name,
             }
 
-            for nurp_name in sample_nurps:
-                _, samples_by_component = sample_nurps[nurp_name]
+            for nurp_name in sample_envs:
+                _, samples_by_component = sample_envs[nurp_name]
                 if component_name in samples_by_component:
-                    regressed = samples_by_component[component_name].has_regressed(conclusions_by_nurp[nurp_name])
+                    regressed = samples_by_component[component_name].has_regressed(conclusions_by_env[nurp_name])
                 else:
                     regressed = False
 
@@ -555,11 +603,11 @@ def report(request):
             if target_capability_name:
                 extra_columns = []
 
-                for nurp_name in sorted(conclusions_by_nurp.keys()):
+                for nurp_name in sorted(conclusions_by_env.keys()):
                     image_href_params = dict(context)
                     image_href_params['nurp'] = nurp_name
                     extra_columns.append((nurp_name, ImageColumn()))
-                    _, by_component = sample_nurps[nurp_name]
+                    _, by_component = sample_envs[nurp_name]
 
                 test_summary: List[Dict] = list()
 
@@ -569,8 +617,8 @@ def report(request):
                         'name': test_record.test_name,
                     }
 
-                    for nurp_name in sample_nurps:
-                        regressed = has_regression([test_record], conclusions=conclusions_by_nurp[nurp_name])
+                    for nurp_name in sample_envs:
+                        regressed = has_regression([test_record], conclusions=conclusions_by_env[nurp_name])
                         href_params = dict(context)
                         href_params['capability'] = target_capability_name
                         href_params['test_id'] = test_id
@@ -594,11 +642,11 @@ def report(request):
             else:
                 extra_columns = []
 
-                for nurp_name in sorted(conclusions_by_nurp.keys()):
+                for nurp_name in sorted(conclusions_by_env.keys()):
                     image_href_params = dict(context)
                     image_href_params['nurp'] = nurp_name
                     extra_columns.append((nurp_name, ImageColumn()))
-                    _, by_component = sample_nurps[nurp_name]
+                    _, by_component = sample_envs[nurp_name]
 
                 capability_summary: List[Dict] = list()
 
@@ -608,8 +656,8 @@ def report(request):
                         'name': capability_name,
                     }
 
-                    for nurp_name in sample_nurps:
-                        regressed = capability_record.has_regressed(conclusions_by_nurp[nurp_name])
+                    for nurp_name in sample_envs:
+                        regressed = capability_record.has_regressed(conclusions_by_env[nurp_name])
                         href_params = dict(context)
                         href_params['capability'] = capability_name
                         href_params['nurp'] = nurp_name
@@ -632,7 +680,7 @@ def report(request):
                 return render(request, 'main/report-table.html', context)
 
         else:
-            samples_by_id, samples_by_component = sample_nurps[target_nurp_name]
+            samples_by_id, samples_by_component = sample_envs[target_nurp_name]
             if target_component_name and target_component_name not in samples_by_component:
                 return HttpResponse(f'Component not found: {target_component_name}')
 
@@ -641,7 +689,7 @@ def report(request):
                 capability_summary: List[Dict] = list()
                 component_records = samples_by_component[target_component_name]
                 for capability_name in sorted(component_records.capabilities.keys()):
-                    regressed = component_records.capabilities[capability_name].has_regressed(conclusions_by_nurp[target_nurp_name])
+                    regressed = component_records.capabilities[capability_name].has_regressed(conclusions_by_env[target_nurp_name])
                     href_params = dict(context)
                     href_params['capability'] = capability_name
                     capability_summary.append({
@@ -667,7 +715,7 @@ def report(request):
 
                 capability_records = component_records.capabilities[target_capability_name]
                 for tr in sorted(list(capability_records.test_records.values()), key=lambda x: x.test_name):
-                    regressed = has_regression([tr], conclusions_by_nurp[target_nurp_name])
+                    regressed = has_regression([tr], conclusions_by_env[target_nurp_name])
                     href_params = dict(context)
                     href_params['test_id'] = tr.test_id
                     test_summary.append({

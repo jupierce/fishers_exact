@@ -1,70 +1,20 @@
-import re
-import math
-import mmap
-import traceback
 from concurrent.futures import ThreadPoolExecutor
 
 from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable
-from enum import Enum
 
 from django.utils.html import format_html
 from django.http import HttpResponse
 import django_tables2 as tables
 
-from .bq_junit import Junit, select, sum, count, any_value
+from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment
 
-import fast_fisher.fast_fisher_cython
 
 from django.shortcuts import render
-from readiness.settings import BASE_DIR
-
-from google.cloud import bigquery
-
 
 EnvironmentKey = str
 TestId = str
 ComponentName = str
 CapabilityName = str
-
-MAX_CELL_SAMPLES = 512   # must be a power of 2 and divisible by 8
-MULTIPLICATION_SHIFTS = int(math.log2(MAX_CELL_SAMPLES))
-
-if (1 << MULTIPLICATION_SHIFTS) != MAX_CELL_SAMPLES or MAX_CELL_SAMPLES//8*8 != MAX_CELL_SAMPLES:
-    print(f'MAX_CELL_SAMPLES must be a power of 2 and divisible by 8')
-    exit(1)
-
-ALPHA = 0.05
-
-try:
-    table_bin = open(f'{BASE_DIR}/../table.bin', 'rb')
-    table_mmap = mmap.mmap(table_bin.fileno(), length=0, access=mmap.ACCESS_READ)
-except:
-    print(f'WARNING: Precomputed fishers will not be used.')
-    table_mmap = None
-    traceback.print_exc()
-
-
-def fisher_offset(a, b, c, d) -> int:
-    # TODO: use chi^2 instead of normalizing to 500 samples?
-    if a > 500 or b > 500:
-        reducer = min((500 / max(a, 1)), (500 / max(b, 1)))  # use max in case one of the values is 0
-        a = int(a * reducer)
-        b = int(b * reducer)
-    if c > 500 or d > 500:
-        reducer = min((500 / max(c, 1)), (500 / max(d, 1)))
-        c = int(c * reducer)
-        d = int(d * reducer)
-    return (a << (MULTIPLICATION_SHIFTS * 3)) + (b << (MULTIPLICATION_SHIFTS * 2)) + (c << (MULTIPLICATION_SHIFTS * 1)) + d
-
-
-def fisher_significant(a, b, c, d) -> bool:
-    if (not table_mmap) or a > 500 or b > 500 or c > 500 or d > 500:
-        return fast_fisher.fast_fisher_cython.fisher_exact(a, b, c, d, alternative='greater') < 0.05
-    # Otherwise, look it up faster in the precomputed data
-    offset = fisher_offset(a, b, c, d)
-    bin_offset = offset // 8
-    bit_shift = 7 - (offset % 8)
-    return table_mmap[bin_offset] & (1 << bit_shift) > 0
 
 
 class TestRecord(NamedTuple):
@@ -86,145 +36,8 @@ NO_TESTS = TestRecord(
 )
 
 
-class Conclusion(Enum):
-    MISSING_IN_BASIS = 1
-    SIGNIFICANT_IMPROVEMENT = 2
-    SIGNIFICANT_REGRESSION = 3
-
-
-ConclusionMap = Dict[EnvironmentKey, Dict[TestId, Conclusion]]
-
-
-def has_regression(records: Iterable[TestRecord], conclusions: Dict[TestId, Conclusion]) -> bool:
-    """
-    :param records: The records to analyze
-    :param conclusions: The conclusions for all tests analyzed
-    :return: Returns True if even on TestRecord is a regression.
-    """
-    for record in records:
-        conclusion = conclusions.get(record.test_id, None)
-        if conclusion == Conclusion.SIGNIFICANT_REGRESSION:
-            return True
-    return False
-
-
-class CapabilityRecords(NamedTuple):
-    name: CapabilityName
-    test_records: Dict[TestId, TestRecord]
-
-    def has_regressed(self, conclusions: Dict[TestId, Conclusion]) -> bool:
-        return has_regression(self.test_records.values(), conclusions=conclusions)
-
-    def register_test_record(self, test_record: TestRecord):
-        self.test_records[test_record.test_id] = test_record
-
-
-ByCapability = Dict[CapabilityName, CapabilityRecords]
-
-
-class ComponentRecords(NamedTuple):
-    name: ComponentName
-    test_records: Dict[TestId, TestRecord]
-    capabilities: ByCapability
-
-    def has_regressed(self, conclusions: Dict[TestId, Conclusion]) -> bool:
-        return has_regression(self.test_records.values(), conclusions=conclusions)
-
-    def register_test_record(self, test_record: TestRecord):
-        self.test_records[test_record.test_id] = test_record
-
-    def register_test_record_capability(self, capability_name: CapabilityName, test_record: TestRecord):
-        if capability_name not in self.capabilities:
-            self.capabilities[capability_name] = CapabilityRecords(capability_name, dict())
-        self.capabilities[capability_name].test_records[test_record.test_id] = test_record
-
-
-ById = Dict[TestId, TestRecord]
-ByComponent = Dict[ComponentName, ComponentRecords]
-
-
 def index(request):
     return render(request, "main/index.html")
-
-
-component_pattern = re.compile(r'\[[^\\]+?\]')
-
-
-def categorize(sql_query) -> Dict[EnvironmentKey, Tuple[ById, ByComponent]]:
-    environments: Dict[EnvironmentKey, Tuple[ById, ByComponent]] = dict()
-
-    for row in sql_query.execute():
-        environment_name = ' '.join((row.network, row.upgrade, row.arch, row.platform))
-
-        if environment_name not in environments:
-            by_id: ById = dict()
-            by_component: ByComponent = dict()
-            environments[environment_name] = (by_id, by_component)
-        else:
-            by_id, by_component = environments[environment_name]
-
-        if row.success_count is None:
-            # Not sure why, but bigquery can return None for some SUMs.
-            # Potentially because success_val was not set on all original rows
-            continue
-
-        flake_count = row.flake_count
-        success_count = row.success_count
-        # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
-        # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
-        # failure) is included. This could make total_count - flake_count a negative value.
-        total_count = max(success_count, row.total_count - flake_count)
-
-        r = TestRecord(
-            test_id=row.test_id,
-            test_name=row.test_name,
-            success_count=success_count,
-            failure_count=total_count - success_count,
-            total_count=total_count,
-            flake_count=flake_count
-        )
-        by_id[r.test_id] = r
-        labels = re.findall(component_pattern, r.test_name)
-        for label in labels:
-            if label not in by_component:
-                by_component[label] = ComponentRecords(name=label, test_records=dict(), capabilities=dict())
-            by_component[label].register_test_record(r)
-
-            capability = r.test_id[:1]
-            by_component[label].register_test_record_capability(capability, r)
-
-    return environments
-
-
-def calculate_conclusions(basis_envs: Dict[EnvironmentKey, Tuple[ById, ByComponent]], sample_envs: Dict[EnvironmentKey, Tuple[ById, ByComponent]]) -> ConclusionMap:
-    conclusions_map: ConclusionMap = dict()
-    for nurp_name in sample_envs:
-        basis_by_id, _ = basis_envs.get(nurp_name, (dict(), dict()))
-        samples_by_id, _ = sample_envs[nurp_name]
-        by_conclusion: Dict[TestId, Conclusion] = dict()
-        conclusions_map[nurp_name] = by_conclusion
-
-        for test_id, sample_result in samples_by_id.items():
-            basis_result = basis_by_id.get(test_id, None)
-            if not basis_result or basis_result.total_count == 0:
-                by_conclusion[test_id] = Conclusion.MISSING_IN_BASIS
-                continue
-
-            basis_pass_percentage = basis_result.success_count / basis_result.total_count
-            sample_pass_percentage = sample_result.success_count / sample_result.total_count
-            improved = sample_pass_percentage >= basis_pass_percentage
-
-            significant = fisher_significant(
-                sample_result.failure_count,
-                sample_result.success_count,
-                basis_result.failure_count,
-                basis_result.success_count,
-            )
-
-            if significant:
-                by_conclusion[test_id] = Conclusion.SIGNIFICANT_IMPROVEMENT if improved else Conclusion.SIGNIFICANT_REGRESSION
-
-    return conclusions_map
 
 
 class ImageColumnLink(NamedTuple):
@@ -325,6 +138,7 @@ def report(request):
     target_upgrade_name = insufficient_sanitization('upgrade', None)
     target_arch_name = insufficient_sanitization('arch', None)
     target_network_name = insufficient_sanitization('network', None)
+    group_by = insufficient_sanitization('group_by', None)
 
     j = Junit
     pqb = select(
@@ -403,12 +217,15 @@ def report(request):
     # waiting for bigquery).
 
     executor = ThreadPoolExecutor(2)
-    basis_future = executor.submit(categorize, (basis_query))
-    sample_future = executor.submit(categorize, (sample_query))
-    basis_envs = basis_future.result()
-    sample_envs = sample_future.result()
+    basis_environment_model = EnvironmentModel()
+    sample_environment_model = EnvironmentModel()
+    basis_future = executor.submit(basis_environment_model.read_in_query, basis_query, group_by)
+    sample_future = executor.submit(sample_environment_model.read_in_query, sample_query, group_by)
+    basis_future.result()
+    sample_future.result()
+    sample_environment_model.build_mass_assessment_cache(basis_environment_model)
 
-    conclusions_by_env = calculate_conclusions(basis_envs=basis_envs, sample_envs=sample_envs)
+    ordered_environment_names: List[EnvironmentName] = sorted(list(sample_environment_model.get_environment_names()) + list(basis_environment_model.get_environment_names()))
 
     context = {
         'basis_release': basis_release,
@@ -423,8 +240,8 @@ def report(request):
         if not target_nurp_name:
             return HttpResponse(f'No nurp parameter was specified')
 
-        samples_by_id, samples_by_component = sample_envs[target_nurp_name]
-        basis_by_id, _ = basis_envs[target_nurp_name]
+        samples_by_id, samples_by_component = sample_environment_model[target_nurp_name]
+        basis_by_id, _ = basis_environment_model[target_nurp_name]
 
         if target_test_id not in samples_by_id:
             return HttpResponse(f'Target test {target_test_id} not found in nurp: {target_nurp_name}')
@@ -551,12 +368,12 @@ def report(request):
         extra_columns = []
         all_component_names = set()
 
-        for nurp_name in sorted(conclusions_by_env.keys()):
+        for environment_name in ordered_environment_names:
             image_href_params = dict(context)
-            image_href_params['nurp'] = nurp_name
-            extra_columns.append((nurp_name, ImageColumn()))
-            _, by_component = sample_envs[nurp_name]
-            all_component_names.update(by_component.keys())
+            image_href_params['environment'] = environment_name
+            extra_columns.append((environment_name, ImageColumn()))
+            sample_environment_test_records = sample_environment_model.get_environment_test_records(environment_name)
+            all_component_names.update(sample_environment_test_records.get_component_names())
 
         for component_name in sorted(list(all_component_names)):
             if 'sig' not in component_name:
@@ -566,19 +383,18 @@ def report(request):
                 'name': component_name,
             }
 
-            for nurp_name in sample_envs:
-                _, samples_by_component = sample_envs[nurp_name]
-                if component_name in samples_by_component:
-                    regressed = samples_by_component[component_name].has_regressed(conclusions_by_env[nurp_name])
-                else:
-                    regressed = False
+            for environment_name in ordered_environment_names:
+                sample_environment_test_records: EnvironmentTestRecords = sample_environment_model.get_environment_test_records(environment_name)
+                sample_component_test_records = sample_environment_test_records.get_component_test_records(component_name)
+
+                component_assessment: TestRecordAssessment = sample_component_test_records.assessment()
 
                 href_params = dict(context)
                 href_params['component'] = component_name
-                href_params['nurp'] = nurp_name
+                href_params['nurp'] = environment_name
 
-                row[nurp_name] = ImageColumnLink(
-                    image_path='/main/red.png' if regressed else '/main/green.png',
+                row[environment_name] = ImageColumnLink(
+                    image_path=f'/main/{component_assessment.value}',
                     height=16, width=16,
                     href='/main/report',
                     href_params=dict(href_params)
@@ -603,11 +419,11 @@ def report(request):
             if target_capability_name:
                 extra_columns = []
 
-                for nurp_name in sorted(conclusions_by_env.keys()):
+                for environment_name in sorted(conclusions_by_env.keys()):
                     image_href_params = dict(context)
-                    image_href_params['nurp'] = nurp_name
-                    extra_columns.append((nurp_name, ImageColumn()))
-                    _, by_component = sample_envs[nurp_name]
+                    image_href_params['nurp'] = environment_name
+                    extra_columns.append((environment_name, ImageColumn()))
+                    _, by_component = sample_environment_model[environment_name]
 
                 test_summary: List[Dict] = list()
 
@@ -617,13 +433,13 @@ def report(request):
                         'name': test_record.test_name,
                     }
 
-                    for nurp_name in sample_envs:
-                        regressed = has_regression([test_record], conclusions=conclusions_by_env[nurp_name])
+                    for environment_name in sample_environment_model:
+                        regressed = has_regression([test_record], conclusions=conclusions_by_env[environment_name])
                         href_params = dict(context)
                         href_params['capability'] = target_capability_name
                         href_params['test_id'] = test_id
-                        href_params['nurp'] = nurp_name
-                        row[nurp_name] = ImageColumnLink(
+                        href_params['nurp'] = environment_name
+                        row[environment_name] = ImageColumnLink(
                             image_path='/main/red.png' if regressed else '/main/green.png',
                             height=16, width=16,
                             href='/main/report',
@@ -642,11 +458,11 @@ def report(request):
             else:
                 extra_columns = []
 
-                for nurp_name in sorted(conclusions_by_env.keys()):
+                for environment_name in sorted(conclusions_by_env.keys()):
                     image_href_params = dict(context)
-                    image_href_params['nurp'] = nurp_name
-                    extra_columns.append((nurp_name, ImageColumn()))
-                    _, by_component = sample_envs[nurp_name]
+                    image_href_params['nurp'] = environment_name
+                    extra_columns.append((environment_name, ImageColumn()))
+                    _, by_component = sample_environment_model[environment_name]
 
                 capability_summary: List[Dict] = list()
 
@@ -656,12 +472,12 @@ def report(request):
                         'name': capability_name,
                     }
 
-                    for nurp_name in sample_envs:
-                        regressed = capability_record.has_regressed(conclusions_by_env[nurp_name])
+                    for environment_name in sample_environment_model:
+                        regressed = capability_record.has_regressed(conclusions_by_env[environment_name])
                         href_params = dict(context)
                         href_params['capability'] = capability_name
-                        href_params['nurp'] = nurp_name
-                        row[nurp_name] = ImageColumnLink(
+                        href_params['nurp'] = environment_name
+                        row[environment_name] = ImageColumnLink(
                             image_path='/main/red.png' if regressed else '/main/green.png',
                             height=16, width=16,
                             href='/main/report',
@@ -680,7 +496,7 @@ def report(request):
                 return render(request, 'main/report-table.html', context)
 
         else:
-            samples_by_id, samples_by_component = sample_envs[target_nurp_name]
+            samples_by_id, samples_by_component = sample_environment_model[target_nurp_name]
             if target_component_name and target_component_name not in samples_by_component:
                 return HttpResponse(f'Component not found: {target_component_name}')
 

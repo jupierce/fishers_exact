@@ -35,12 +35,26 @@
                 var sample_start_dt = $("#sample_start_dt").val();
                 var sample_end_dt = $("#sample_end_dt").val();
 
-                if (!basis_start_dt || !basis_end_dt || !sample_start_dt || !sample_end_dt) {
+                var group_by = ""
+                if ( $("#gbc-cloud").is(':checked') ) {
+                    group_by += "cloud,"
+                }
+                if ( $("#gbc-arch").is(':checked') ) {
+                    group_by += "arch,"
+                }
+                if ( $("#gbc-network").is(':checked') ) {
+                    group_by += "network,"
+                }
+                if ( $("#gbc-upgrade").is(':checked') ) {
+                    group_by += "upgrade,"
+                }
+
+                if (!basis_start_dt || !basis_end_dt || !sample_start_dt || !sample_end_dt || group_by == "") {
                     return;
                 }
                 document.querySelector('#content').innerHTML = "Updating report...";
 
-                fetch('/main/report?sample_release=' + sample_release + '&basis_release=' + basis_release + '&sample_start_dt=' + sample_start_dt + '&sample_end_dt=' + sample_end_dt + '&basis_start_dt=' + basis_start_dt + '&basis_end_dt=' + basis_end_dt)
+                fetch('/main/report?group_by=' + group_by + '&sample_release=' + sample_release + '&basis_release=' + basis_release + '&sample_start_dt=' + sample_start_dt + '&sample_end_dt=' + sample_end_dt + '&basis_start_dt=' + basis_start_dt + '&basis_end_dt=' + basis_end_dt)
                 .then(response => response.text())
                 .then(text => {
                     document.querySelector('#content').innerHTML = text;
@@ -71,6 +85,17 @@
                 $('.selectmenu').selectmenu({
                   change: function( event, ui ) {showReport();}
                 });
+
+                $('#group-by').buttonset();
+
+                $( "input[type=checkbox]" ).checkboxradio({
+                    icon: false,
+                });
+
+                $( "input[type=checkbox]" ).change(function(event) {
+                    showReport();
+                });
+
 
                 var now = new Date();
                 var last48 = new Date(now - (48 * 60 * 60 * 1000));
@@ -126,6 +151,19 @@
                 <input class="dtp" id="sample_end_dt" type="text" >
             </div>
         </fieldset>
+
+        <fieldset id="group-by" style="display:inline-block;">
+            <legend>Group By </legend>
+            <label for="gbc-cloud">Cloud</label>
+            <input type="checkbox" name="checkbox-1" id="gbc-cloud" checked="checked">
+            <label for="gbc-arch">Arch</label>
+            <input type="checkbox" name="checkbox-2" id="gbc-arch" checked="checked">
+            <label for="gbc-network">Network</label>
+            <input type="checkbox" name="checkbox-3" id="gbc-network" checked="checked">
+            <label for="gbc-upgrade">Upgrade</label>
+            <input type="checkbox" name="checkbox-4" id="gbc-upgrade">
+        </fieldset>
+
         <br>
 
         <!-- Contents loaded from server is inserted here by javascript -->

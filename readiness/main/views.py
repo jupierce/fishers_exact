@@ -426,31 +426,31 @@ def report(request):
             if target_capability_name:
                 extra_columns = []
 
-                test_lookup: Dict[TestName, TestId] = dict()
+                test_id_lookup: Dict[TestName, TestId] = dict()
                 for environment_name in sample_environment_model.get_ordered_environment_names():
                     image_href_params = dict(context)
                     image_href_params['environment'] = environment_name
                     extra_columns.append((environment_name, ImageColumn()))
 
                     # It's unlikely but possible that a component in one environment has different capabilities
-                    # that a component in another environment. Build a full set of names across environments.
-                    for test_record in sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_records():
-                        test_lookup[test_record.test_name] = test_record.test_id
+                    # than a component in another environment. Build a full set of names across environments.
+                    for test_record_set in sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_sets():
+                        test_id_lookup[test_record_set.canonical_test_name] = test_record_set.test_id
 
                 test_summary: List[Dict] = list()
 
-                for test_name in sorted(list(test_lookup.keys())):
-                    test_id = test_lookup[test_name]
+                for test_name in sorted(list(test_id_lookup.keys())):
+                    test_record_set_test_id = test_id_lookup[test_name]
 
                     row = {
                         'name': test_name,
                     }
 
                     for environment_name in sample_environment_model.get_ordered_environment_names():
-                        assessment: TestRecordAssessment = sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record(test_id).assessment()
+                        assessment: TestRecordAssessment = sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_set(test_record_set_test_id).assessment()
                         href_params = dict(context)
                         href_params['capability'] = target_capability_name
-                        href_params['test_id'] = test_id
+                        href_params['test_id'] = test_record_set_test_id
                         href_params['environment'] = environment_name
                         row[environment_name] = ImageColumnLink(
                             image_path=f'/main/{assessment.value}',
@@ -549,7 +549,7 @@ def report(request):
                     return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
 
                 capability_records = component_records.capabilities[target_capability_name]
-                for tr in sorted(list(capability_records.test_records.values()), key=lambda x: x.test_name):
+                for tr in sorted(list(capability_records.test_record_sets.values()), key=lambda x: x.test_name):
                     regressed = has_regression([tr], conclusions_by_env[target_environment_name])
                     href_params = dict(context)
                     href_params['test_id'] = tr.test_id

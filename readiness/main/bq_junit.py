@@ -186,30 +186,54 @@ class TestRecord:
         self._assessment = assessment
 
 
-class CapabilityTestRecords:
+class TestRecordSet:
 
-    def __init__(self, name: CapabilityName):
-        self.name: ComponentName = name
+    def __init__(self, test_id: TestId):
+        self.test_id = test_id
         self.test_records: Dict[TestUUID, TestRecord] = dict()
-
-    def get_test_uuids(self):
-        return list(self.test_records.keys())
+        self.canonical_test_name = None
 
     def add_test_record(self, test_record: TestRecord):
         if test_record.test_uuid in self.test_records:
             return
         self.test_records[test_record.test_uuid] = test_record
-
-    def get_test_record(self, test_uuid: TestUUID) -> TestRecord:
-        if test_uuid not in self.test_records:
-            raise ValueError(f'Capability has no test record {test_uuid}')
-        return self.test_records[test_uuid]
-
-    def get_test_records(self) -> Iterable[TestRecord]:
-        return self.test_records.values()
+        if not self.canonical_test_name:
+            # TODO: for now, just pick the first name we find and treat it as the canonical name.
+            self.canonical_test_name = test_record.test_name
 
     def assessment(self) -> TestRecordAssessment:
         return TestRecord.aggregate_test_record_assessment(self.test_records.values())
+
+    def get_test_name(self) -> str:
+        # Over time, test names may change between releases. Return the canonical
+        # for the test_id.
+        return self.canonical_test_name
+
+
+class CapabilityTestRecords:
+
+    def __init__(self, name: CapabilityName):
+        self.name: ComponentName = name
+        self.test_record_sets: Dict[TestId, TestRecordSet] = dict()
+
+    def get_test_record_set_ids(self):
+        return list(self.test_record_sets.keys())
+
+    def get_test_record_set(self, test_id: TestId):
+        if test_id in self.test_record_sets:
+            return self.test_record_sets[test_id]
+        ntrs = TestRecordSet(test_id)
+        self.test_record_sets[test_id] = ntrs
+        return ntrs
+
+    def get_test_record_sets(self):
+        return self.test_record_sets.values()
+
+    def add_test_record(self, test_record: TestRecord):
+        self.get_test_record_set(test_record.test_id).add_test_record(test_record)
+
+    def assessment(self) -> TestRecordAssessment:
+        return TestRecord.aggregate_assessment([ctr.assessment() for ctr in self.test_record_sets.values()])
 
 
 class ComponentTestRecords:
@@ -231,12 +255,17 @@ class ComponentTestRecords:
 
     def find_associated_capabilities(self, test_record: TestRecord) -> Iterable[CapabilityName]:
         associated_capabilities: List[CapabilityName] = list()
-        associated_capabilities.append(test_record.test_id[:1])  # Just a stop gap in place of looking these up from a database
+        primary_capability_name = test_record.test_id[:1]  # Just a stop gap in place of looking these up from a database
         if not self.grouping_by_upgrade:
             if test_record.upgrade == 'upgrade-minor':
-                associated_capabilities.append('y-stream upgrade')
-            if test_record.upgrade == 'upgrade-micro':
-                associated_capabilities.append('z-stream upgrade')
+                associated_capabilities.append(f'y-upgrade: {primary_capability_name}')
+            elif test_record.upgrade == 'upgrade-micro':
+                associated_capabilities.append(f'z-upgrade: {primary_capability_name}')
+            else:
+                associated_capabilities.append(f'install: {primary_capability_name}')
+        else:
+            associated_capabilities.append(primary_capability_name)
+
         return associated_capabilities
 
     def add_test_record(self, test_record: TestRecord):

@@ -73,6 +73,7 @@ sum = func.sum
 EnvironmentName = str
 ComponentName = str
 CapabilityName = str
+TestUUID = str
 TestId = str
 TestName = str
 
@@ -119,13 +120,16 @@ class TestRecord:
         return TestRecord.aggregate_assessment([test_record._assessment for test_record in test_records])
 
     def __init__(self,
+                 platform: str,
+                 network: str,
+                 arch: str,
+                 upgrade: str,
                  test_id: TestId,
                  test_name: TestName,
                  success_count: int = 0,
                  failure_count: int = 0,
                  total_count: int = 0,
                  flake_count: int = 0,
-                 upgrade: str = None,
                  assessment: TestRecordAssessment = None):
         self.test_id = test_id
         self.test_name = test_name
@@ -133,8 +137,13 @@ class TestRecord:
         self.failure_count = failure_count
         self.total_count = total_count
         self.flake_count = flake_count
-        self.upgrade = upgrade
         self._assessment = assessment
+
+        self.platform = platform
+        self.network = network
+        self.arch = arch
+        self.upgrade = upgrade
+        self.test_uuid: TestUUID = f'p={platform};n={network};a={arch};u={upgrade};id={test_id}'
 
     def assessment(self) -> TestRecordAssessment:
         if self._assessment is None:
@@ -181,55 +190,26 @@ class CapabilityTestRecords:
 
     def __init__(self, name: CapabilityName):
         self.name: ComponentName = name
-        self.test_records: Dict[TestId, TestRecord] = dict()
+        self.test_records: Dict[TestUUID, TestRecord] = dict()
 
-    def get_test_ids(self):
+    def get_test_uuids(self):
         return list(self.test_records.keys())
 
     def add_test_record(self, test_record: TestRecord):
-        if test_record.test_id in self.test_records:
+        if test_record.test_uuid in self.test_records:
             return
-        self.test_records[test_record.test_id] = test_record
+        self.test_records[test_record.test_uuid] = test_record
 
-    def get_test_record(self, test_id: TestId) -> TestRecord:
-        if test_id not in self.test_records:
-            self.test_records[test_id] = TestRecord(
-                test_id=test_id,
-                test_name='',
-            )
-        return self.test_records[test_id]
+    def get_test_record(self, test_uuid: TestUUID) -> TestRecord:
+        if test_uuid not in self.test_records:
+            raise ValueError(f'Capability has no test record {test_uuid}')
+        return self.test_records[test_uuid]
 
     def get_test_records(self) -> Iterable[TestRecord]:
         return self.test_records.values()
 
     def assessment(self) -> TestRecordAssessment:
         return TestRecord.aggregate_test_record_assessment(self.test_records.values())
-
-    def build_mass_assessment_cache(self, basis_capability_test_records: "CapabilityTestRecords"):
-        basis_test_ids = set(basis_capability_test_records.get_test_ids())
-        sample_test_ids = set(self.get_test_ids())
-        test_ids_not_in_basis = basis_test_ids.difference(sample_test_ids)
-
-        all_ids = basis_test_ids.union(sample_test_ids)
-
-        for test_id in test_ids_not_in_basis:
-            basis_test_record = basis_capability_test_records.get_test_record(test_id)
-            # TODO: if a test_id has been officially deprecated by staff, do not add this record
-            place_holder_record = TestRecord(
-                assessment=TestRecordAssessment.MISSING_IN_SAMPLE,
-                test_id=basis_test_record.test_id,
-                test_name=basis_test_record.test_name,
-                upgrade=basis_test_record.upgrade,
-            )
-            self.add_test_record(place_holder_record)
-
-        for test_id in all_ids:
-            sample_test_record = self.test_records[test_id]
-            if test_id in basis_capability_test_records.test_records:
-                basis_test_record = basis_capability_test_records.test_records[test_id]
-                sample_test_record.compute_assessment(basis_test_record)
-            else:
-                sample_test_record._assessment = TestRecordAssessment.MISSING_IN_BASIS
 
 
 class ComponentTestRecords:
@@ -267,22 +247,13 @@ class ComponentTestRecords:
     def assessment(self) -> TestRecordAssessment:
         return TestRecord.aggregate_assessment([ctr.assessment() for ctr in self.capability_test_records.values()])
 
-    def build_mass_assessment_cache(self, basis_component_test_records: "ComponentTestRecords"):
-        all_capability_names = set(self.get_capability_names())
-        all_capability_names.update(basis_component_test_records.get_capability_names())
-
-        for capability_name in all_capability_names:
-            sample_capability_test_records = self.get_capability_test_records(capability_name)
-            basis_capability_test_records = basis_component_test_records.get_capability_test_records(capability_name)
-            sample_capability_test_records.build_mass_assessment_cache(basis_capability_test_records)
-
 
 class EnvironmentTestRecords:
 
     COMPONENT_NAME_PATTERN = re.compile(r'\[[^\\]+?\]')
 
     def __init__(self, name: EnvironmentName, grouping_by_upgrade=False, platform: str = '*', arch: str = '*', network: str = '*', upgrade: str = '*'):
-        self.all_test_record_ids: Set[TestId] = set()
+        self.all_test_record_uuids: Set[TestUUID] = set()
         self.name: EnvironmentName = name
         self.grouping_by_upgrade = grouping_by_upgrade
         self.component_test_records: Dict[ComponentName, ComponentTestRecords] = dict()
@@ -290,6 +261,17 @@ class EnvironmentTestRecords:
         self.arch = arch
         self.network = network
         self.upgrade = upgrade
+
+        # Within a given environment, results for a specific TestId can be added several times.
+        # For example, if the environment is grouping by Platform+Arch+Network, the
+        # environment model add to this EnvironmentTestRecords multiple identical TestId values
+        # but each will be associated with a different upgrade.
+        # So EnvironmentTestRecords work based on TestUUID which is a combination of
+        # NURP+TestID which makes it completely unique for the Environment (i.e. the query
+        # to the database must be grouping on these attributes to ensure that only a single
+        # such row exists in the results).
+        # All regression is assessed on TestUUID comparisons between basis and sample.
+        self.all_test_records: Dict[TestUUID, TestRecord] = dict()
 
     def get_breadcrumb(self) -> str:
         return f"[cloud='{self.platform}' arch='{self.arch}' network='{self.network}' upgrade='{self.upgrade}']"
@@ -305,7 +287,8 @@ class EnvironmentTestRecords:
         return re.findall(EnvironmentTestRecords.COMPONENT_NAME_PATTERN, test_record.test_name)
 
     def add_test_record(self, test_record: TestRecord) -> Iterable[ComponentName]:
-        self.all_test_record_ids.add(test_record.test_id)
+        self.all_test_records[test_record.test_uuid] = test_record
+        self.all_test_record_uuids.add(test_record.test_uuid)
         # Find a list of all component names to which this test belongs.
         # Register the test with each component name.
         add_to_components = self.find_associated_components(test_record)
@@ -322,13 +305,32 @@ class EnvironmentTestRecords:
 
     def build_mass_assessment_cache(self, basis_environment_test_records: "EnvironmentTestRecords"):
 
-        all_names = set(self.get_component_names())
-        all_names.update(basis_environment_test_records.get_component_names())
+        basis_test_uuids = set(basis_environment_test_records.all_test_record_uuids)
+        sample_test_uuids = set(self.all_test_record_uuids)
+        test_uuids_not_in_sample = basis_test_uuids.difference(sample_test_uuids)
 
-        for name in all_names:
-            sample_component_test_records = self.get_component_test_records(name)
-            basis_component_test_records = basis_environment_test_records.get_component_test_records(name)
-            sample_component_test_records.build_mass_assessment_cache(basis_component_test_records)
+        for test_uuid in test_uuids_not_in_sample:
+            basis_test_record = basis_environment_test_records.all_test_records[test_uuid]
+            # TODO: if a test_id has been officially deprecated by staff, do not add this record
+            place_holder_record = TestRecord(
+                platform=basis_test_record.platform,
+                network=basis_test_record.network,
+                upgrade=basis_test_record.upgrade,
+                arch=basis_test_record.arch,
+                assessment=TestRecordAssessment.MISSING_IN_SAMPLE,
+                test_id=basis_test_record.test_id,
+                test_name=basis_test_record.test_name,
+            )
+            # Adding these missing tests ensures that the sample environment has a superset
+            # of components and capabilities compared to the basis environment.
+            self.add_test_record(place_holder_record)
+
+        for test_uuid, sample_test_record in self.all_test_records.items():
+            if test_uuid in basis_environment_test_records.all_test_records:
+                basis_test_record = basis_environment_test_records.all_test_records[test_uuid]
+                sample_test_record.compute_assessment(basis_test_record)
+            else:
+                sample_test_record._assessment = TestRecordAssessment.MISSING_IN_BASIS
 
 
 class EnvironmentModel:
@@ -386,13 +388,16 @@ class EnvironmentModel:
             total_count = max(success_count, row.total_count - flake_count)
 
             r = TestRecord(
+                platform=row.platform,
+                network=row.network,
+                upgrade=row.upgrade,
+                arch=row.arch,
                 test_id=row.test_id,
                 test_name=row.test_name,
                 success_count=success_count,
                 failure_count=total_count - success_count,
                 total_count=total_count,
                 flake_count=flake_count,
-                upgrade=row.upgrade,
             )
 
             environment_test_records = self.get_environment_test_records(env_name, group_by_upgrade, **env_attributes)
@@ -401,8 +406,8 @@ class EnvironmentModel:
 
     def build_mass_assessment_cache(self, basis_model: "EnvironmentModel"):
 
-        # Get a list of all environment - including both basis and sample in case
-        # there is one in basis that was nerfed.
+        # Get a list of all environments - including both basis and sample in case
+        # there is one in basis that no longer exists in samples.
         all_names = set(self.get_ordered_environment_names())
         all_names.update(basis_model.get_ordered_environment_names())
 

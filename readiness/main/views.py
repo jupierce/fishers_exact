@@ -1,12 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
 
-from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable
+from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable, Set
 
 from django.utils.html import format_html
 from django.http import HttpResponse
 import django_tables2 as tables
 
-from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment
+from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName
 
 
 from django.shortcuts import render
@@ -139,6 +139,7 @@ def report(request):
     target_arch_name = insufficient_sanitization('arch', None)
     target_network_name = insufficient_sanitization('network', None)
     group_by = insufficient_sanitization('group_by', None)
+    target_environment_name = insufficient_sanitization('environment', None)
 
     j = Junit
     pqb = select(
@@ -225,7 +226,7 @@ def report(request):
     sample_future.result()
     sample_environment_model.build_mass_assessment_cache(basis_environment_model)
 
-    ordered_environment_names: List[EnvironmentName] = sorted(list(sample_environment_model.get_environment_names()) + list(basis_environment_model.get_environment_names()))
+    ordered_environment_names: List[EnvironmentName] = sorted(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names()))
 
     context = {
         'basis_release': basis_release,
@@ -234,17 +235,23 @@ def report(request):
         'sample_release': sample_release,
         'sample_start_dt': sample_start_dt,
         'sample_end_dt': sample_end_dt,
+        'group_by': group_by,
     }
 
     if target_test_id:  # Rendering a specifically requested test id
-        if not target_nurp_name:
-            return HttpResponse(f'No nurp parameter was specified')
+        if not target_environment_name:
+            return HttpResponse(f'No environment parameter was specified')
+        if not target_component_name:
+            return HttpResponse(f'No component parameter was specified')
+        if not target_capability_name:
+            return HttpResponse(f'No capability parameter was specified')
 
-        samples_by_id, samples_by_component = sample_environment_model[target_nurp_name]
-        basis_by_id, _ = basis_environment_model[target_nurp_name]
+
+        samples_by_id, samples_by_component = sample_environment_model[target_environment_name]
+        basis_by_id, _ = basis_environment_model[target_environment_name]
 
         if target_test_id not in samples_by_id:
-            return HttpResponse(f'Target test {target_test_id} not found in nurp: {target_nurp_name}')
+            return HttpResponse(f'Target test {target_test_id} not found in nurp: {target_environment_name}')
 
         sample_test_record = samples_by_id[target_test_id]
         basis_test_record = basis_by_id.get(target_test_id, TestRecord(test_name='', total_count=0, success_count=0, failure_count=0, test_id=target_test_id, flake_count=0))
@@ -360,7 +367,7 @@ def report(request):
 
         prowjob_table = ProwjobTable(data=prowjob_analysis)
         context['table'] = prowjob_table
-        context['breadcrumb'] = f'{target_nurp_name} > {target_component_name} > {target_capability_name} > {sample_test_record.test_name}'
+        context['breadcrumb'] = f'{target_environment_name} > {target_component_name} > {target_capability_name} > {sample_test_record.test_name}'
         return render(request, 'main/report-test.html', context)
 
     if not target_component_name:  # Rendering all components
@@ -391,7 +398,7 @@ def report(request):
 
                 href_params = dict(context)
                 href_params['component'] = component_name
-                href_params['nurp'] = environment_name
+                href_params['environment'] = environment_name
 
                 row[environment_name] = ImageColumnLink(
                     image_path=f'/main/{component_assessment.value}',
@@ -414,33 +421,39 @@ def report(request):
 
         context['component'] = target_component_name
 
-        if not target_nurp_name:  # Rendering a component or capability with nurps as column heading
+        if not target_environment_name:  # Rendering a component or capability with environments as column heading
 
             if target_capability_name:
                 extra_columns = []
 
-                for environment_name in sorted(conclusions_by_env.keys()):
+                test_lookup: Dict[TestName, TestId] = dict()
+                for environment_name in sample_environment_model.get_ordered_environment_names():
                     image_href_params = dict(context)
-                    image_href_params['nurp'] = environment_name
+                    image_href_params['environment'] = environment_name
                     extra_columns.append((environment_name, ImageColumn()))
-                    _, by_component = sample_environment_model[environment_name]
+
+                    # It's unlikely but possible that a component in one environment has different capabilities
+                    # that a component in another environment. Build a full set of names across environments.
+                    for test_record in sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_records():
+                        test_lookup[test_record.test_name] = test_record.test_id
 
                 test_summary: List[Dict] = list()
 
-                for test_id, test_record in by_component[target_component_name].capabilities[target_capability_name].test_records.items():
+                for test_name in sorted(list(test_lookup.keys())):
+                    test_id = test_lookup[test_name]
 
                     row = {
-                        'name': test_record.test_name,
+                        'name': test_name,
                     }
 
-                    for environment_name in sample_environment_model:
-                        regressed = has_regression([test_record], conclusions=conclusions_by_env[environment_name])
+                    for environment_name in sample_environment_model.get_ordered_environment_names():
+                        assessment: TestRecordAssessment = sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record(test_id).assessment()
                         href_params = dict(context)
                         href_params['capability'] = target_capability_name
                         href_params['test_id'] = test_id
-                        href_params['nurp'] = environment_name
+                        href_params['environment'] = environment_name
                         row[environment_name] = ImageColumnLink(
-                            image_path='/main/red.png' if regressed else '/main/green.png',
+                            image_path=f'/main/{assessment.value}',
                             height=16, width=16,
                             href='/main/report',
                             href_params=href_params,
@@ -455,30 +468,36 @@ def report(request):
                 context['breadcrumb'] = f'{target_component_name} > {target_capability_name}'
                 return render(request, 'main/report-table.html', context)
 
-            else:
+            else:  # Rending the capabilities of a component vs environment columns
                 extra_columns = []
 
-                for environment_name in sorted(conclusions_by_env.keys()):
+                # It's remote, but possible that the same component within different
+                # environments have different capabilities. Develop a
+                # set of all names across each environment.
+                capability_names: Set[str] = set()
+
+                for environment_name in sample_environment_model.get_ordered_environment_names():
                     image_href_params = dict(context)
-                    image_href_params['nurp'] = environment_name
+                    image_href_params['environment'] = environment_name
                     extra_columns.append((environment_name, ImageColumn()))
-                    _, by_component = sample_environment_model[environment_name]
+                    capability_names.update(
+                        sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_names()
+                    )
 
                 capability_summary: List[Dict] = list()
-
-                for capability_name, capability_record in by_component[target_component_name].capabilities.items():
+                for capability_name in sorted(capability_names):
 
                     row = {
                         'name': capability_name,
                     }
 
-                    for environment_name in sample_environment_model:
-                        regressed = capability_record.has_regressed(conclusions_by_env[environment_name])
+                    for environment_name in ordered_environment_names:
+                        assessment = sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(capability_name).assessment()
                         href_params = dict(context)
                         href_params['capability'] = capability_name
-                        href_params['nurp'] = environment_name
+                        href_params['environment'] = environment_name
                         row[environment_name] = ImageColumnLink(
-                            image_path='/main/red.png' if regressed else '/main/green.png',
+                            image_path=f'/main/{assessment.value}',
                             height=16, width=16,
                             href='/main/report',
                             href_params=href_params,
@@ -496,16 +515,16 @@ def report(request):
                 return render(request, 'main/report-table.html', context)
 
         else:
-            samples_by_id, samples_by_component = sample_environment_model[target_nurp_name]
+            samples_by_id, samples_by_component = sample_environment_model[target_environment_name]
             if target_component_name and target_component_name not in samples_by_component:
                 return HttpResponse(f'Component not found: {target_component_name}')
 
-            context['nurp'] = target_nurp_name
+            context['environment'] = target_environment_name
             if not target_capability_name:
                 capability_summary: List[Dict] = list()
                 component_records = samples_by_component[target_component_name]
                 for capability_name in sorted(component_records.capabilities.keys()):
-                    regressed = component_records.capabilities[capability_name].has_regressed(conclusions_by_env[target_nurp_name])
+                    regressed = component_records.capabilities[capability_name].has_regressed(conclusions_by_env[target_environment_name])
                     href_params = dict(context)
                     href_params['capability'] = capability_name
                     capability_summary.append({
@@ -520,7 +539,7 @@ def report(request):
 
                 table = AllComponentsTable(capability_summary, extra_columns=[('status', ImageColumn())])
                 context['table'] = table
-                context['breadcrumb'] = f'{target_nurp_name} > {target_component_name}'
+                context['breadcrumb'] = f'{target_environment_name} > {target_component_name}'
                 return render(request, 'main/report-table.html', context)
             else:  # Rendering the capabilities of a specific component
                 test_summary: List[Dict] = list()
@@ -531,7 +550,7 @@ def report(request):
 
                 capability_records = component_records.capabilities[target_capability_name]
                 for tr in sorted(list(capability_records.test_records.values()), key=lambda x: x.test_name):
-                    regressed = has_regression([tr], conclusions_by_env[target_nurp_name])
+                    regressed = has_regression([tr], conclusions_by_env[target_environment_name])
                     href_params = dict(context)
                     href_params['test_id'] = tr.test_id
                     test_summary.append({
@@ -546,5 +565,5 @@ def report(request):
 
                 table = AllComponentsTable(test_summary, extra_columns=[('status', ImageColumn())])
                 context['table'] = table
-                context['breadcrumb'] = f'{target_nurp_name} > {target_component_name} > {target_capability_name}'
+                context['breadcrumb'] = f'{target_environment_name} > {target_component_name} > {target_capability_name}'
                 return render(request, 'main/report-table.html', context)

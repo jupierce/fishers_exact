@@ -8,15 +8,39 @@
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Component Readiness Report</title>
+
+        <style>
+                a.outcome_S:link {
+                        color: green !important;
+                }
+                a.outcome_S:visited {
+                        color: lightgreen !important;
+                }
+                a.outcome_s:link {
+                        color: green !important;
+                }
+                a.outcome_s:visited {
+                        color: lightgreen !important;
+                }
+                a.outcome_F:link {
+                        color: red !important;
+                }
+                a.outcome_F:visited {
+                        color: lightpink !important;
+                }
+        </style>
+
+
         <script src="{% static 'main/jquery/jquery.min.js' %}"></script>
         <link rel="stylesheet" href="{% static 'main/jquery-ui/jquery-ui.structure.min.css' %}">
         <link href="{% static 'django_tables2/themes/paleblue/css/screen.css' %}" rel="stylesheet">
         <link rel="stylesheet" href="{% static 'main/jquery-ui/jquery-ui.theme.min.css' %}">
         <script src="{% static 'main/jquery-ui/jquery-ui.min.js' %}"></script>
+
 </head>
 
 <body>
-<h2>{{breadcrumb}}</h2>
+<h2><a href="/main">/</a> {{breadcrumb}}</h2>
 <br>
 Test Name: {{sample_test.test_name}}
 <br>
@@ -40,10 +64,6 @@ Basis Release {{basis_release}} <br>
 Fisher's Exact: {{fishers_exact}}
 <br><br>
 
-Note: It is possible for this test to be RED and all prowjobs to be GREEN. It means that a statistically significant regression
-of the test was not detected at the individual prowjob level and that the regression could only be detected when the results of
-all the different prowjobs were summed together.
-<br>
 <br>
 {% render_table table %}
 

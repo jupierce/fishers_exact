@@ -193,6 +193,12 @@ class TestRecordSet:
         self.test_records: Dict[TestUUID, TestRecord] = dict()
         self.canonical_test_name = None
 
+    def get_test_record_uuids(self) -> List[TestUUID]:
+        return list(self.test_records.keys())
+
+    def get_test_record(self, test_id: TestId) -> TestRecord:
+        return self.test_records.get(test_id, None)
+
     def add_test_record(self, test_record: TestRecord):
         if test_record.test_uuid in self.test_records:
             return

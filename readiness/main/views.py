@@ -6,34 +6,14 @@ from django.utils.html import format_html
 from django.http import HttpResponse
 import django_tables2 as tables
 
-from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName
+from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId
+
+import fast_fisher.fast_fisher_cython
 
 
 from django.shortcuts import render
 
-EnvironmentKey = str
-TestId = str
-ComponentName = str
-CapabilityName = str
-
-
-class TestRecord(NamedTuple):
-    test_id: Optional[TestId]
-    test_name: Optional[str]
-    success_count: int
-    failure_count: int
-    total_count: int
-    flake_count: int
-
-
-NO_TESTS = TestRecord(
-    test_id=None,
-    test_name=None,
-    success_count=0,
-    failure_count=0,
-    total_count=0,
-    flake_count=0,
-)
+ProwjobName = str
 
 
 def index(request):
@@ -73,11 +53,25 @@ def dict_to_params_url(params):
     return '&'.join([f'{key}={value}' for key, value in params.items()])
 
 
+def _render_prowjob_rows(rows) -> str:
+    result = ''
+    for row in rows:
+        if row['flake_count'] > 0:
+            outcome_char = 's'
+        elif row['success_count'] > 0:
+            outcome_char = 'S'
+        else:
+            outcome_char = 'F'
+        result += f'<a class="outcome_{outcome_char}" href="https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/origin-ci-test/{row["file_path"]}">{outcome_char}</a> '
+    return format_html(result)
+
+
 class ProwjobTable(tables.Table):
     prowjob_name = tables.Column()
     basis_info = tables.Column()
+    basis_runs = tables.Column()
     sample_info = tables.Column()
-    individual_job_regression = ImageColumn()
+    sample_runs = tables.Column()
 
     class Meta:
         attrs = {"class": "paleblue"}
@@ -134,6 +128,7 @@ def report(request):
     target_component_name = insufficient_sanitization('component', None)
     target_capability_name = insufficient_sanitization('capability', None)
     target_test_id = insufficient_sanitization('test_id', None)
+    target_test_uuid = insufficient_sanitization('test_uuid', None)
     target_platform_name = insufficient_sanitization('platform', None)
     target_upgrade_name = insufficient_sanitization('upgrade', None)
     target_arch_name = insufficient_sanitization('arch', None)
@@ -168,20 +163,30 @@ def report(request):
 
     assert_all_set((sample_start_dt, sample_end_dt, sample_release), 'At least one sample coordinate has not been specified')
 
-    if any((target_network_name, target_upgrade_name, target_arch_name, target_platform_name, target_test_id)):
-        assert_all_set((target_network_name, target_upgrade_name, target_arch_name, target_platform_name), 'Elements of primary drill key were not specified')
-
+    if target_upgrade_name:
         pqb = pqb.filter(
-            j.network == target_network_name,
-            j.upgrade == target_upgrade_name,
-            j.arch == target_arch_name,
-            j.platform == target_platform_name,
+            j.upgrade == target_upgrade_name
         )
 
-        if target_test_id:
-            pqb = pqb.filter(
-                j.test_id == target_test_id
-            )
+    if target_arch_name:
+        pqb = pqb.filter(
+            j.arch == target_arch_name
+        )
+
+    if target_network_name:
+        pqb = pqb.filter(
+            j.network == target_network_name
+        )
+
+    if target_platform_name:
+        pqb = pqb.filter(
+            j.platform == target_platform_name
+        )
+
+    if target_test_id:
+        pqb = pqb.filter(
+            j.test_id == target_test_id
+        )
 
     # q = f'''
     #     SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
@@ -238,7 +243,7 @@ def report(request):
         'group_by': group_by,
     }
 
-    if target_test_id:  # Rendering a specifically requested test id
+    if target_test_id:  # Rendering a specifically requested TestRecordSet test_id
         if not target_environment_name:
             return HttpResponse(f'No environment parameter was specified')
         if not target_component_name:
@@ -246,15 +251,54 @@ def report(request):
         if not target_capability_name:
             return HttpResponse(f'No capability parameter was specified')
 
+        sample_test_record_set = sample_environment_model.get_environment_test_records(target_environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_set(target_test_id)
+        uuid_count = len(sample_test_record_set.test_records)
+        if uuid_count > 1:
+            # There are more than one test uuids that have been grouped into this test record set,
+            # so provide a UI that allows the user to view each UUID and drill to the one they
+            # want more information for.
+            pass  # TODO: Implement
+        elif uuid_count == 1:
+            # There is only one test uuid associated with this test record set. Send the user
+            # straight to the UI for the specific uuid.
+            target_test_uuid = sample_test_record_set.get_test_record_uuids()[0]
+        else:
+            return HttpResponse('No tests are associated with this environment and test id')
 
-        samples_by_id, samples_by_component = sample_environment_model[target_environment_name]
-        basis_by_id, _ = basis_environment_model[target_environment_name]
+    if target_test_uuid:
+        if not target_environment_name:
+            return HttpResponse(f'No environment parameter was specified')
+        if not target_component_name:
+            return HttpResponse(f'No component parameter was specified')
+        if not target_capability_name:
+            return HttpResponse(f'No capability parameter was specified')
+        if not target_test_id:
+            return HttpResponse(f'No test_id parameter was specified')
 
-        if target_test_id not in samples_by_id:
-            return HttpResponse(f'Target test {target_test_id} not found in nurp: {target_environment_name}')
+        sample_test_record_set = sample_environment_model.get_environment_test_records(
+            target_environment_name).get_component_test_records(target_component_name).get_capability_test_records(
+            target_capability_name).get_test_record_set(target_test_id)
+        sample_test_record = sample_test_record_set.get_test_record(target_test_uuid)
 
-        sample_test_record = samples_by_id[target_test_id]
-        basis_test_record = basis_by_id.get(target_test_id, TestRecord(test_name='', total_count=0, success_count=0, failure_count=0, test_id=target_test_id, flake_count=0))
+        if not sample_test_record:
+            return HttpResponse('No sample test record found for test uuid')
+
+        basis_test_record_set = basis_environment_model.get_environment_test_records(
+            target_environment_name).get_component_test_records(target_component_name).get_capability_test_records(
+            target_capability_name).get_test_record_set(target_test_id)
+
+        basis_test_record = basis_test_record_set.get_test_record(target_test_uuid)
+
+        if not basis_test_record:
+            basis_test_record = TestRecord(
+                platform=sample_test_record.platform,
+                network=sample_test_record.network,
+                upgrade=sample_test_record.upgrade,
+                arch=sample_test_record.arch,
+                test_id=sample_test_record.test_id,
+                test_name=sample_test_record.test_name
+            )
+
         context['sample_test'] = sample_test_record
         context['basis_test'] = basis_test_record
         context['fishers_exact'] = str(fast_fisher.fast_fisher_cython.fisher_exact(
@@ -263,105 +307,90 @@ def report(request):
             alternative='greater'
         ))
 
-        q = f'''
-            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count 
-            FROM `openshift-gce-devel.ci_analysis_us.junit` 
-            WHERE modified_time >= DATETIME(TIMESTAMP "{basis_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{basis_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
-                  AND branch = "{basis_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, prowjob_name        
-        '''
-        basis_prowjob_runs_rows = bq.query(q)
+        base_test_query = select(
+            j.file_path,
+            any_value('prowjob_name').label('prowjob_name'),
+            sum(j.success_val).label('success_count'),
+            sum(j.flake_count).label('flake_count'),
+            count('*').label('total_count'),  # Including flakes
+        ).where(
+            j.platform == sample_test_record.platform,
+            j.network == sample_test_record.network,
+            j.upgrade == sample_test_record.upgrade,
+            j.arch == sample_test_record.arch,
+            j.test_id == sample_test_record.test_id
+        ).group_by(
+            j.file_path,
+            j.modified_time
+        ).order_by(
+            j.modified_time  # Show test runs in roughly chronological order
+        )
 
-        q = f'''
-            SELECT prowjob_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
-            FROM `openshift-gce-devel.ci_analysis_us.junit` 
-            WHERE modified_time >= DATETIME(TIMESTAMP "{sample_start_dt}:00+00") AND modified_time < DATETIME(TIMESTAMP "{sample_end_dt}:00+00") {target_nurp_filter} {target_test_filter}
-                  AND branch = "{sample_release}" AND file_path NOT LIKE "%/junit_operator.xml" GROUP BY network, upgrade, arch, platform, prowjob_name        
-        '''
+        basis_test_query = base_test_query.where(
+            j.modified_time >= j.format_modified_time(basis_start_dt),
+            j.modified_time < j.format_modified_time(basis_end_dt),
+            j.branch == basis_release
+        )
 
-        sample_prowjob_runs_rows = bq.query(q)
+        sample_test_query = base_test_query.where(
+            j.modified_time >= j.format_modified_time(sample_start_dt),
+            j.modified_time < j.format_modified_time(sample_end_dt),
+            j.branch == sample_release
+        )
 
         # Aggregate test successes/failures by prowjob
         prowjob_names = set()
-        basis_prowjob_runs: Dict[str, TestRecord] = dict()
-        for row in basis_prowjob_runs_rows:
+
+        basis_prowjob_runs: Dict[ProwjobName, List] = dict()
+        for row in basis_test_query.execute():
             prowjob_name: str = row['prowjob_name']
             prowjob_name = prowjob_name.replace(basis_release, 'X.X')  # Strip release specific information from prowjob name
             prowjob_names.add(prowjob_name)
-            flake_count = row['flake_count']
-            success_count = row['success_count']
-            # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
-            # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
-            # failure) is included. This could make total_count - flake_count a negative value.
-            total_count = max(success_count, row['total_count'] - flake_count)
-            basis_prowjob_runs[prowjob_name] = TestRecord(
-                test_id=target_test_id,
-                test_name=None,
-                success_count=success_count,
-                total_count=total_count,
-                failure_count=total_count - success_count,
-                flake_count=flake_count,
-            )
+            if prowjob_name not in basis_prowjob_runs:
+                basis_prowjob_runs[prowjob_name] = list()
+            basis_prowjob_runs[prowjob_name].append(row)
 
-        sample_prowjob_runs: Dict[str, TestRecord] = dict()
-        for row in sample_prowjob_runs_rows:
-            prowjob_name = row['prowjob_name']
+        sample_prowjob_runs: Dict[ProwjobName, List] = dict()
+        for row in sample_test_query.execute():
+            prowjob_name: str = row['prowjob_name']
             prowjob_name = prowjob_name.replace(sample_release, 'X.X')  # Strip release specific information from prowjob name
             prowjob_names.add(prowjob_name)
-            flake_count = row['flake_count']
-            success_count = row['success_count']
-            # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
-            # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
-            # failure) is included. This could make total_count - flake_count a negative value.
-            total_count = max(success_count, row['total_count'] - flake_count)
-            sample_prowjob_runs[prowjob_name] = TestRecord(
-                test_id=target_test_id,
-                test_name=None,
-                success_count=success_count,
-                total_count=total_count,
-                failure_count=total_count - success_count,
-                flake_count=flake_count,
-            )
+            if prowjob_name not in sample_prowjob_runs:
+                sample_prowjob_runs[prowjob_name] = list()
+            sample_prowjob_runs[prowjob_name].append(row)
 
         prowjob_analysis: List[Dict[str, str]] = list()
         for prowjob_name in sorted(prowjob_names):
-            basis_result = basis_prowjob_runs.get(prowjob_name, NO_TESTS)
-            sample_result = sample_prowjob_runs.get(prowjob_name, NO_TESTS)
 
-            if basis_result.total_count == 0 or sample_result.total_count == 0:
-                regressed = False
-            else:
-                basis_pass_percentage = basis_result.success_count / basis_result.total_count
-                sample_pass_percentage = sample_result.success_count / sample_result.total_count
-                improved = sample_pass_percentage >= basis_pass_percentage
+            basis_prowjob_rows = basis_prowjob_runs.get(prowjob_name, list())
+            basis_success_count = 0
+            basis_flake_count = 0
+            basis_total_count = 0
 
-                regressed = fisher_significant(
-                    sample_result.failure_count,
-                    sample_result.success_count,
-                    basis_result.failure_count,
-                    basis_result.success_count,
-                )
+            for basis_prowjob_row in basis_prowjob_rows:
+                basis_success_count += basis_prowjob_row['success_count']
+                basis_flake_count += basis_prowjob_row['flake_count']
+                basis_total_count += basis_prowjob_row['total_count']  # Includes flakes
+            basis_failure_count = max(0, basis_total_count-basis_flake_count-basis_success_count)
 
-                if improved:
-                    regressed = False
+            sample_prowjob_rows = sample_prowjob_runs.get(prowjob_name, list())
+            sample_success_count = 0
+            sample_flake_count = 0
+            sample_total_count = 0
 
-            basis_success_count = basis_result.success_count
-            basis_failure_count = basis_result.failure_count
-            basis_flake_count = basis_result.flake_count
-            sample_success_count = sample_result.success_count
-            sample_failure_count = sample_result.failure_count
-            sample_flake_count = sample_result.flake_count
+            for sample_prowjob_row in sample_prowjob_rows:
+                sample_success_count += sample_prowjob_row['success_count']
+                sample_flake_count += sample_prowjob_row['flake_count']
+                sample_total_count += sample_prowjob_row['total_count']  # Includes flakes
+            sample_failure_count = max(0, sample_total_count-sample_flake_count-sample_success_count)
 
             prowjob_analysis.append(
                 {
                     'prowjob_name': prowjob_name,
                     'basis_info': f'successes={basis_success_count} failures={basis_failure_count} (flakes={basis_flake_count})',
+                    'basis_runs': _render_prowjob_rows(basis_prowjob_rows),
                     'sample_info': f'successes={sample_success_count} failures={sample_failure_count} (flakes={sample_flake_count})',
-                    'individual_job_regression': ImageColumnLink(
-                        image_path='/main/red.png' if regressed else '/main/green.png',
-                        height=16, width=16,
-                        href=None,
-                        href_params=dict()
-                    )
+                    'sample_runs': _render_prowjob_rows(sample_prowjob_rows),
                 }
             )
 
@@ -434,8 +463,8 @@ def report(request):
 
                     # It's unlikely but possible that a component in one environment has different capabilities
                     # than a component in another environment. Build a full set of names across environments.
-                    for test_record_set in sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_sets():
-                        test_id_lookup[test_record_set.canonical_test_name] = test_record_set.test_id
+                    for sample_test_record_set in sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_sets():
+                        test_id_lookup[sample_test_record_set.canonical_test_name] = sample_test_record_set.test_id
 
                 test_summary: List[Dict] = list()
 

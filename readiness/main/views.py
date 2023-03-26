@@ -22,10 +22,21 @@ def index(request):
 
 class ImageColumnLink(NamedTuple):
     image_path: str
+    title: Optional[str] = None
     height: Optional[int] = None
     width: Optional[int] = None
     href: Optional[str] = None
     href_params: Optional[Dict[str, str]] = None
+
+
+class AssessmentImageColumnLink:
+    def __init__(self, assessment: TestRecordAssessment, href: str = '/main/report', href_params: Dict[str, str] = None):
+        self.image_path = f'main/{assessment.image_path}'
+        self.height = 16
+        self.width = 16
+        self.href = href
+        self.href_params = href_params
+        self.title = assessment.description
 
 
 class ImageColumn(tables.Column):
@@ -41,7 +52,11 @@ class ImageColumn(tables.Column):
         if value.width:
             width_attr = f'width="{value.height}" '
 
-        content = f'<img {height_attr}{width_attr} src="/static/{image_path}"></img>'
+        title_attr = ''
+        if value.title:
+            title_attr = f'title="{value.title}" '
+
+        content = f'<img {title_attr}{height_attr}{width_attr} src="/static/{image_path}"></img>'
         if value.href:
             content = f'<a href="{value.href}?{dict_to_params_url(value.href_params)}">{content}</a>'
         return format_html(content)
@@ -243,6 +258,25 @@ def report(request):
         'group_by': group_by,
     }
 
+    if target_platform_name:
+        context['platform'] = target_platform_name
+    if target_network_name:
+        context['network'] = target_network_name
+    if target_upgrade_name:
+        context['upgrade'] = target_upgrade_name
+    if target_arch_name:
+        context['arch'] = target_arch_name
+
+    def populate_environment_link_context(environment_test_records: EnvironmentTestRecords, link_context: Dict):
+        if environment_test_records.platform:
+            link_context['platform'] = environment_test_records.platform
+        if environment_test_records.network:
+            link_context['network'] = environment_test_records.network
+        if environment_test_records.upgrade:
+            link_context['upgrade'] = environment_test_records.upgrade
+        if environment_test_records.arch:
+            link_context['arch'] = environment_test_records.arch
+
     if target_test_id:  # Rendering a specifically requested TestRecordSet test_id
         if not target_environment_name:
             return HttpResponse(f'No environment parameter was specified')
@@ -309,7 +343,7 @@ def report(request):
 
         base_test_query = select(
             j.file_path,
-            any_value('prowjob_name').label('prowjob_name'),
+            any_value(j.prowjob_name).label('prowjob_name'),
             sum(j.success_val).label('success_count'),
             sum(j.flake_count).label('flake_count'),
             count('*').label('total_count'),  # Including flakes
@@ -428,11 +462,10 @@ def report(request):
                 href_params = dict(context)
                 href_params['component'] = component_name
                 href_params['environment'] = environment_name
+                populate_environment_link_context(sample_environment_test_records, href_params)
 
-                row[environment_name] = ImageColumnLink(
-                    image_path=f'/main/{component_assessment.value}',
-                    height=16, width=16,
-                    href='/main/report',
+                row[environment_name] = AssessmentImageColumnLink(
+                    component_assessment,
                     href_params=dict(href_params)
                 )
 
@@ -476,15 +509,15 @@ def report(request):
                     }
 
                     for environment_name in sample_environment_model.get_ordered_environment_names():
-                        assessment: TestRecordAssessment = sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_set(test_record_set_test_id).assessment()
+                        sample_environment_test_records = sample_environment_model.get_environment_test_records(environment_name)
+                        assessment: TestRecordAssessment = sample_environment_test_records.get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_set(test_record_set_test_id).assessment()
                         href_params = dict(context)
                         href_params['capability'] = target_capability_name
                         href_params['test_id'] = test_record_set_test_id
                         href_params['environment'] = environment_name
-                        row[environment_name] = ImageColumnLink(
-                            image_path=f'/main/{assessment.value}',
-                            height=16, width=16,
-                            href='/main/report',
+                        populate_environment_link_context(sample_environment_test_records, href_params)
+                        row[environment_name] = AssessmentImageColumnLink(
+                            assessment,
                             href_params=href_params,
                         )
 
@@ -521,14 +554,14 @@ def report(request):
                     }
 
                     for environment_name in ordered_environment_names:
-                        assessment = sample_environment_model.get_environment_test_records(environment_name).get_component_test_records(target_component_name).get_capability_test_records(capability_name).assessment()
+                        sample_environment_test_records = sample_environment_model.get_environment_test_records(environment_name)
+                        assessment = sample_environment_test_records.get_component_test_records(target_component_name).get_capability_test_records(capability_name).assessment()
                         href_params = dict(context)
                         href_params['capability'] = capability_name
                         href_params['environment'] = environment_name
-                        row[environment_name] = ImageColumnLink(
-                            image_path=f'/main/{assessment.value}',
-                            height=16, width=16,
-                            href='/main/report',
+                        populate_environment_link_context(sample_environment_test_records, href_params)
+                        row[environment_name] = AssessmentImageColumnLink(
+                            assessment,
                             href_params=href_params,
                         )
 
@@ -543,25 +576,23 @@ def report(request):
                 context['breadcrumb'] = f'{target_component_name}'
                 return render(request, 'main/report-table.html', context)
 
-        else:
-            samples_by_id, samples_by_component = sample_environment_model[target_environment_name]
-            if target_component_name and target_component_name not in samples_by_component:
-                return HttpResponse(f'Component not found: {target_component_name}')
-
+        else:  # Showing capabilities for specific component in specific environment
             context['environment'] = target_environment_name
-            if not target_capability_name:
+            sample_environment_test_records = sample_environment_model.get_environment_test_records(target_environment_name)
+            sample_component_test_records = sample_environment_test_records.get_component_test_records(target_component_name)
+
+            if not target_capability_name:  # Show capabilities of a specific component in a specific environment
                 capability_summary: List[Dict] = list()
-                component_records = samples_by_component[target_component_name]
-                for capability_name in sorted(component_records.capabilities.keys()):
-                    regressed = component_records.capabilities[capability_name].has_regressed(conclusions_by_env[target_environment_name])
+                for capability_name in sorted(sample_component_test_records.get_capability_names()):
+                    sample_capability_test_records = sample_component_test_records.get_capability_test_records(capability_name)
+                    assessment = sample_capability_test_records.assessment()
                     href_params = dict(context)
                     href_params['capability'] = capability_name
+                    populate_environment_link_context(sample_environment_test_records, href_params)
                     capability_summary.append({
                         'name': capability_name,
-                        'status': ImageColumnLink(
-                            image_path='/main/red.png' if regressed else '/main/green.png',
-                            height=16, width=16,
-                            href='/main/report',
+                        'status': AssessmentImageColumnLink(
+                            assessment,
                             href_params=href_params,
                         )
                     })
@@ -570,24 +601,20 @@ def report(request):
                 context['table'] = table
                 context['breadcrumb'] = f'{target_environment_name} > {target_component_name}'
                 return render(request, 'main/report-table.html', context)
-            else:  # Rendering the capabilities of a specific component
+            else:  # Show tests of a specific capability in a specific environment
                 test_summary: List[Dict] = list()
                 context['capability'] = target_capability_name
-                component_records = samples_by_component[target_component_name]
-                if target_capability_name not in component_records.capabilities:
-                    return HttpResponse(f'Capability {target_capability_name} not found in component {target_component_name}')
+                capability_test_records = sample_component_test_records.get_capability_test_records(target_capability_name)
 
-                capability_records = component_records.capabilities[target_capability_name]
-                for tr in sorted(list(capability_records.test_record_sets.values()), key=lambda x: x.test_name):
-                    regressed = has_regression([tr], conclusions_by_env[target_environment_name])
+                for test_record_set in sorted(list(capability_test_records.get_test_record_sets()), key=lambda x: x.canonical_test_name):
+                    assessment = test_record_set.assessment()
                     href_params = dict(context)
-                    href_params['test_id'] = tr.test_id
+                    href_params['test_id'] = test_record_set.test_id
+                    populate_environment_link_context(sample_environment_test_records, href_params)
                     test_summary.append({
-                        'name': tr.test_name,
-                        'status': ImageColumnLink(
-                            image_path='/main/red.png' if regressed else '/main/green.png',
-                            height=16, width=16,
-                            href='/main/report',
+                        'name': test_record_set.canonical_test_name,
+                        'status': AssessmentImageColumnLink(
+                            assessment,
                             href_params=href_params,
                         )
                     })

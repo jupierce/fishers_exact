@@ -79,12 +79,17 @@ TestName = str
 
 
 class TestRecordAssessment(Enum):
-    EXTREME_REGRESSION = 'fire.png'
-    SIGNIFICANT_REGRESSION = 'red.png'
-    MISSING_IN_SAMPLE = 'red.png'
-    NOT_SIGNIFICANT = 'green.png'
-    MISSING_IN_BASIS = 'green.png'
-    SIGNIFICANT_IMPROVEMENT = 'green-heart.png'
+    EXTREME_REGRESSION = (-3, 'Extreme regression', 'fire.png')
+    SIGNIFICANT_REGRESSION = (-2, 'Significant regression', 'red.png')
+    MISSING_IN_SAMPLE = (-1, 'No test runs in sample', 'red-question-mark.png')
+    NOT_SIGNIFICANT = (0, 'No significant deviation', 'green.png')
+    MISSING_IN_BASIS = (1, 'No records in basis data', 'green.png')
+    SIGNIFICANT_IMPROVEMENT = (2, 'Significant improvement', 'green-heart.png')
+
+    def __init__(self, val: int, description: str, image_path: str):
+        self.val = val
+        self.description = description
+        self.image_path = image_path
 
 
 class TestRecord:
@@ -117,7 +122,7 @@ class TestRecord:
 
     @classmethod
     def aggregate_test_record_assessment(cls, test_records: Iterable["TestRecord"]) -> TestRecordAssessment:
-        return TestRecord.aggregate_assessment([test_record._assessment for test_record in test_records])
+        return TestRecord.aggregate_assessment([test_record.cached_assessment for test_record in test_records])
 
     def __init__(self,
                  platform: str,
@@ -137,7 +142,7 @@ class TestRecord:
         self.failure_count = failure_count
         self.total_count = total_count
         self.flake_count = flake_count
-        self._assessment = assessment
+        self.cached_assessment = assessment
 
         self.platform = platform
         self.network = network
@@ -146,12 +151,12 @@ class TestRecord:
         self.test_uuid: TestUUID = f'p={platform};n={network};a={arch};u={upgrade};id={test_id}'
 
     def assessment(self) -> TestRecordAssessment:
-        if self._assessment is None:
+        if self.cached_assessment is None:
             return TestRecordAssessment.MISSING_IN_BASIS
-        return self._assessment
+        return self.cached_assessment
 
     def compute_assessment(self, basis_test_record: "TestRecord"):
-        if self._assessment:
+        if self.cached_assessment:
             # Already assessed
             return
 
@@ -183,7 +188,7 @@ class TestRecord:
             else:
                 assessment = TestRecordAssessment.NOT_SIGNIFICANT
 
-        self._assessment = assessment
+        self.cached_assessment = assessment
 
 
 class TestRecordSet:
@@ -287,7 +292,7 @@ class EnvironmentTestRecords:
 
     COMPONENT_NAME_PATTERN = re.compile(r'\[[^\\]+?\]')
 
-    def __init__(self, name: EnvironmentName, grouping_by_upgrade=False, platform: str = '*', arch: str = '*', network: str = '*', upgrade: str = '*'):
+    def __init__(self, name: EnvironmentName, grouping_by_upgrade=False, platform: str = '', arch: str = '', network: str = '', upgrade: str = ''):
         self.all_test_record_uuids: Set[TestUUID] = set()
         self.name: EnvironmentName = name
         self.grouping_by_upgrade = grouping_by_upgrade
@@ -365,7 +370,7 @@ class EnvironmentTestRecords:
                 basis_test_record = basis_environment_test_records.all_test_records[test_uuid]
                 sample_test_record.compute_assessment(basis_test_record)
             else:
-                sample_test_record._assessment = TestRecordAssessment.MISSING_IN_BASIS
+                sample_test_record.cached_assessment = TestRecordAssessment.MISSING_IN_BASIS
 
 
 class EnvironmentModel:

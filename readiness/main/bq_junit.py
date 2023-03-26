@@ -100,7 +100,7 @@ class TestRecord:
         found_missing_in_sample = False
         for test_assessment in test_assessments:
             # A single significant regression in any test means an overall regression
-            if test_assessment is TestRecordAssessment.SIGNIFICANT_REGRESSION:
+            if test_assessment.val < 0:
                 return test_assessment
 
             if test_assessment is TestRecordAssessment.MISSING_IN_SAMPLE:
@@ -155,7 +155,7 @@ class TestRecord:
             return TestRecordAssessment.MISSING_IN_BASIS
         return self.cached_assessment
 
-    def compute_assessment(self, basis_test_record: "TestRecord"):
+    def compute_assessment(self, basis_test_record: "TestRecord", alpha: float, regression_when_missing: bool):
         if self.cached_assessment:
             # Already assessed
             return
@@ -164,7 +164,10 @@ class TestRecord:
         if basis_test_record and basis_test_record.total_count_minus_flakes > 0:
 
             if basis_test_record.total_count_minus_flakes > 0 and self.total_count_minus_flakes == 0:
-                return TestRecordAssessment.MISSING_IN_SAMPLE
+                if regression_when_missing:
+                    return TestRecordAssessment.MISSING_IN_SAMPLE
+                else:
+                    return TestRecordAssessment.NOT_SIGNIFICANT
 
             basis_pass_percentage = basis_test_record.success_count / basis_test_record.total_count_minus_flakes
             sample_pass_percentage = self.success_count / self.total_count_minus_flakes
@@ -175,6 +178,7 @@ class TestRecord:
                 self.success_count,
                 basis_test_record.failure_count,
                 basis_test_record.success_count,
+                alpha=alpha,
             )
 
             if significant:
@@ -346,7 +350,7 @@ class EnvironmentTestRecords:
     def assessment(self) -> TestRecordAssessment:
         return TestRecord.aggregate_assessment([ctr.assessment() for ctr in self.component_test_records.values()])
 
-    def build_mass_assessment_cache(self, basis_environment_test_records: "EnvironmentTestRecords"):
+    def build_mass_assessment_cache(self, basis_environment_test_records: "EnvironmentTestRecords", alpha: float, regression_when_missing: bool):
 
         basis_test_uuids = set(basis_environment_test_records.all_test_record_uuids)
         sample_test_uuids = set(self.all_test_record_uuids)
@@ -360,7 +364,7 @@ class EnvironmentTestRecords:
                 network=basis_test_record.network,
                 upgrade=basis_test_record.upgrade,
                 arch=basis_test_record.arch,
-                assessment=TestRecordAssessment.MISSING_IN_SAMPLE,
+                assessment=TestRecordAssessment.MISSING_IN_SAMPLE if regression_when_missing else TestRecordAssessment.NOT_SIGNIFICANT,
                 test_id=basis_test_record.test_id,
                 test_name=basis_test_record.test_name,
             )
@@ -371,7 +375,7 @@ class EnvironmentTestRecords:
         for test_uuid, sample_test_record in self.all_test_records.items():
             if test_uuid in basis_environment_test_records.all_test_records:
                 basis_test_record = basis_environment_test_records.all_test_records[test_uuid]
-                sample_test_record.compute_assessment(basis_test_record)
+                sample_test_record.compute_assessment(basis_test_record, alpha, regression_when_missing)
             else:
                 sample_test_record.cached_assessment = TestRecordAssessment.MISSING_IN_BASIS
 
@@ -447,7 +451,7 @@ class EnvironmentModel:
             component_name_modified = environment_test_records.add_test_record(r)
             self.all_component_names.update(component_name_modified)
 
-    def build_mass_assessment_cache(self, basis_model: "EnvironmentModel"):
+    def build_mass_assessment_cache(self, basis_model: "EnvironmentModel", alpha: float = 0.05, regression_when_missing: bool=True):
 
         # Get a list of all environments - including both basis and sample in case
         # there is one in basis that no longer exists in samples.
@@ -457,4 +461,4 @@ class EnvironmentModel:
         for environment_name in all_names:
             sample_environment_test_records = self.get_environment_test_records(environment_name)
             basis_environment_test_records = basis_model.get_environment_test_records(environment_name)
-            sample_environment_test_records.build_mass_assessment_cache(basis_environment_test_records)
+            sample_environment_test_records.build_mass_assessment_cache(basis_environment_test_records, alpha, regression_when_missing)

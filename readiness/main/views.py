@@ -153,6 +153,12 @@ def report(request):
     sample_start_dt = insufficient_sanitization('sample_start_dt')
     sample_end_dt = insufficient_sanitization('sample_end_dt')
 
+    confidence_param = insufficient_sanitization("confidence", "95")
+    fisher_alpha: float = (100 - int(confidence_param)) / 100
+
+    missing_samples_param = insufficient_sanitization("missing", "ok")
+    regression_when_missing = missing_samples_param != "ok"
+
     target_component_name = insufficient_sanitization('component', None)
     target_capability_name = insufficient_sanitization('capability', None)
     target_test_id = insufficient_sanitization('test_id', None)
@@ -161,8 +167,10 @@ def report(request):
     target_upgrade_name = insufficient_sanitization('upgrade', None)
     target_arch_name = insufficient_sanitization('arch', None)
     target_network_name = insufficient_sanitization('network', None)
-    group_by_param = insufficient_sanitization('group_by', None)
     target_environment_name = insufficient_sanitization('environment', None)
+
+    group_by_param = insufficient_sanitization('group_by', None)
+
     exclude_platforms_param = insufficient_sanitization('exclude_platforms', None)
     exclude_arches_param = insufficient_sanitization('exclude_arches', None)
     exclude_networks_param = insufficient_sanitization('exclude_networks', None)
@@ -298,7 +306,7 @@ def report(request):
     sample_future = executor.submit(sample_environment_model.read_in_query, sample_query, group_by_param)
     basis_future.result()
     sample_future.result()
-    sample_environment_model.build_mass_assessment_cache(basis_environment_model)
+    sample_environment_model.build_mass_assessment_cache(basis_environment_model, alpha=fisher_alpha, regression_when_missing=regression_when_missing)
 
     ordered_environment_names: List[EnvironmentName] = sorted(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names()))
 
@@ -320,6 +328,12 @@ def report(request):
         context['upgrade'] = target_upgrade_name
     if target_arch_name:
         context['arch'] = target_arch_name
+
+    if confidence_param != "95":
+        context['confidence'] = confidence_param
+
+    if missing_samples_param != "ok":
+        context['missing'] = missing_samples_param
 
     def populate_environment_link_context(environment_test_records: EnvironmentTestRecords, link_context: Dict):
         if environment_test_records.platform:
@@ -530,6 +544,7 @@ def report(request):
                     'statistically_significant': fisher_significant(
                         sample_failure_count, sample_success_count,
                         basis_failure_count, basis_success_count,
+                        alpha=fisher_alpha,
                     ),
                 }
             )

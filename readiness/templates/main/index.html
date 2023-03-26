@@ -72,6 +72,15 @@
                 color: darkslateblue;
             }
 
+            #confidence-handle {
+                width: 3em;
+                height: 1.6em;
+                top: 50%;
+                margin-top: -.8em;
+                text-align: center;
+                line-height: 1.6em;
+            }
+
     </style>
 
     <script>
@@ -104,6 +113,15 @@
                 })
 
                 var optional_params = ''
+
+                var confidence = $("#confidence-val").val()
+                if (confidence != "95") {
+                    optional_params += '&confidence=' + confidence;
+                }
+
+                if (!$("#ignore-missing-sample").is(':checked')) {
+                    optional_params += '&missing=regression';
+                }
 
                 var exclude_platforms = ""
                 $(".exclude-platform-checkbox").each(function() {
@@ -207,6 +225,22 @@
                 $("#sample_start_dt").val(date_to_dt(last48));
                 $("#sample_end_dt").val(date_to_dt(now));
                 // showReport();
+
+                var handle = $( "#confidence-handle" );
+                $( "#confidence-slider" ).slider({
+                    min: 60,
+                    max: 99,
+                    value: 95,
+                    create: function() {
+                        var val = $( this ).slider( "value" );
+                        handle.text( val + "%" );
+                        $("#confidence-val").val(""+val);
+                    },
+                    slide: function( event, ui ) {
+                        handle.text( ui.value + "%" );
+                        $("#confidence-val").val(""+ui.value);
+                    }
+                });
 
                 $( "#accordion" ).accordion({
                     heightStyle: "content"
@@ -350,7 +384,17 @@
 
         <h3>Advanced</h3>
         <div>
-            <p>Ignore no samples found</p>
+
+            Required confidence
+            <div id="confidence-slider" style="margin:5%;">
+                <div id="confidence-handle" class="ui-slider-handle"></div>
+            </div>
+            <!-- bug in slider when calling for value after another div loads. Store val in hidden field so we can query it here. -->
+            <input type="hidden" id="confidence-val" value="95" />
+
+            <p>Tests missing in Sample</p>
+            <label for="ignore-missing-sample">Ignore</label>
+            <input type="checkbox" checked="checked" id="ignore-missing-sample"/>
         </div>
     </div>
 

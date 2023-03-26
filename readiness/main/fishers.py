@@ -36,9 +36,9 @@ def fisher_offset(a, b, c, d) -> int:
     return (a << (MULTIPLICATION_SHIFTS * 3)) + (b << (MULTIPLICATION_SHIFTS * 2)) + (c << (MULTIPLICATION_SHIFTS * 1)) + d
 
 
-def fisher_significant(a, b, c, d) -> bool:
-    if (not table_mmap) or a > 500 or b > 500 or c > 500 or d > 500:
-        return fast_fisher.fast_fisher_cython.fisher_exact(a, b, c, d, alternative='greater') < 0.05
+def fisher_significant(a, b, c, d, alpha=ALPHA) -> bool:
+    if (not table_mmap) or a > 500 or b > 500 or c > 500 or d > 500 or alpha != ALPHA:
+        return fast_fisher.fast_fisher_cython.fisher_exact(a, b, c, d, alternative='greater') < alpha
     # Otherwise, look it up faster in the precomputed data
     offset = fisher_offset(a, b, c, d)
     bin_offset = offset // 8

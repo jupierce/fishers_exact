@@ -7,6 +7,7 @@ from django.http import HttpResponse
 import django_tables2 as tables
 
 from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId
+from .fishers import fisher_significant
 
 import fast_fisher.fast_fisher_cython
 
@@ -70,14 +71,25 @@ def dict_to_params_url(params):
 
 def _render_prowjob_rows(rows) -> str:
     result = ''
+    char_count = 0
     for row in rows:
-        if row['flake_count'] > 0:
-            outcome_char = 's'
-        elif row['success_count'] > 0:
-            outcome_char = 'S'
-        else:
-            outcome_char = 'F'
-        result += f'<a class="outcome_{outcome_char}" href="https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/origin-ci-test/{row["file_path"]}">{outcome_char}</a> '
+        # Some files have multiple successes and failures that are not counted as flakes.
+        # An example junit I found had a success of a specific test and then a failure
+        # of the same test which came later.
+        # ref: [sig-arch] Check if alerts are firing during or after upgrade success
+        # So each row may need to be represented by multiple characters.
+        # Use max() to provide sensible results if the time selection in the query
+        # has only selected part of a file.
+        failure_iterations = max(0, row['total_count'] - row['flake_count'] - row['success_count'])
+        flake_iterations = row['flake_count']
+        success_iterations = max(0, row['success_count'] - row['flake_count'])
+
+        char_entries: List[str] = (['S'] * success_iterations) + (['s'] * flake_iterations) + (['F'] * failure_iterations)
+        for outcome_char in char_entries:
+            result += f'<a class="outcome_{outcome_char}" href="https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/origin-ci-test/{row["file_path"]}">{outcome_char}</a> '
+            char_count += 1
+            if char_count % 20 == 0:
+                result += '<br>'
     return format_html(result)
 
 
@@ -87,6 +99,7 @@ class ProwjobTable(tables.Table):
     basis_runs = tables.Column()
     sample_info = tables.Column()
     sample_runs = tables.Column()
+    statistically_significant = tables.Column()
 
     class Meta:
         attrs = {"class": "paleblue"}
@@ -406,6 +419,8 @@ def report(request):
                 basis_flake_count += basis_prowjob_row['flake_count']
                 basis_total_count += basis_prowjob_row['total_count']  # Includes flakes
             basis_failure_count = max(0, basis_total_count-basis_flake_count-basis_success_count)
+            basis_total_minus_flakes = (basis_total_count - basis_flake_count)
+            basis_success_rate = '{:.2f}'.format(0.0 if basis_total_minus_flakes == 0 else 100 * basis_success_count / basis_total_minus_flakes)
 
             sample_prowjob_rows = sample_prowjob_runs.get(prowjob_name, list())
             sample_success_count = 0
@@ -417,14 +432,20 @@ def report(request):
                 sample_flake_count += sample_prowjob_row['flake_count']
                 sample_total_count += sample_prowjob_row['total_count']  # Includes flakes
             sample_failure_count = max(0, sample_total_count-sample_flake_count-sample_success_count)
+            sample_total_minus_flakes = (sample_total_count - sample_flake_count)
+            sample_success_rate = '{:.2f}'.format(0.0 if sample_total_minus_flakes == 0 else 100 * sample_success_count / sample_total_minus_flakes)
 
             prowjob_analysis.append(
                 {
                     'prowjob_name': prowjob_name,
-                    'basis_info': f'successes={basis_success_count} failures={basis_failure_count} (flakes={basis_flake_count})',
+                    'basis_info': format_html(f'rate={basis_success_rate}%<br>successes={basis_success_count}<br>failures={basis_failure_count}<br>flakes={basis_flake_count}'),
                     'basis_runs': _render_prowjob_rows(basis_prowjob_rows),
-                    'sample_info': f'successes={sample_success_count} failures={sample_failure_count} (flakes={sample_flake_count})',
+                    'sample_info': format_html(f'rate={sample_success_rate}%<br>successes={sample_success_count}<br>failures={sample_failure_count}<br>flakes={sample_flake_count}'),
                     'sample_runs': _render_prowjob_rows(sample_prowjob_rows),
+                    'statistically_significant': fisher_significant(
+                        sample_failure_count, sample_success_count,
+                        basis_failure_count, basis_success_count,
+                    ),
                 }
             )
 

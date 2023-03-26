@@ -133,17 +133,17 @@ class TestRecord:
                  test_name: TestName,
                  success_count: int = 0,
                  failure_count: int = 0,
-                 total_count: int = 0,
+                 total_count_minus_flakes: int = 0,
                  flake_count: int = 0,
                  assessment: TestRecordAssessment = None):
         self.test_id = test_id
         self.test_name = test_name
         self.success_count = success_count
         self.failure_count = failure_count
-        self.total_count = total_count
+        self.total_count_minus_flakes = total_count_minus_flakes
         self.flake_count = flake_count
         self.cached_assessment = assessment
-
+        self.success_rate = '{:.2f}'.format(0.0 if total_count_minus_flakes == 0 else 100 * success_count / total_count_minus_flakes)
         self.platform = platform
         self.network = network
         self.arch = arch
@@ -161,13 +161,13 @@ class TestRecord:
             return
 
         assessment: TestRecordAssessment = TestRecordAssessment.MISSING_IN_BASIS
-        if basis_test_record and basis_test_record.total_count > 0:
+        if basis_test_record and basis_test_record.total_count_minus_flakes > 0:
 
-            if basis_test_record.total_count > 0 and self.total_count == 0:
+            if basis_test_record.total_count_minus_flakes > 0 and self.total_count_minus_flakes == 0:
                 return TestRecordAssessment.MISSING_IN_SAMPLE
 
-            basis_pass_percentage = basis_test_record.success_count / basis_test_record.total_count
-            sample_pass_percentage = self.success_count / self.total_count
+            basis_pass_percentage = basis_test_record.success_count / basis_test_record.total_count_minus_flakes
+            sample_pass_percentage = self.success_count / self.total_count_minus_flakes
             improved = sample_pass_percentage >= basis_pass_percentage
 
             significant = fisher_significant(
@@ -425,7 +425,7 @@ class EnvironmentModel:
             # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
             # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
             # failure) is included. This could make total_count - flake_count a negative value.
-            total_count = max(success_count, row.total_count - flake_count)
+            total_count_minus_flakes = max(success_count, row.total_count - flake_count)
 
             r = TestRecord(
                 platform=row.platform,
@@ -435,8 +435,8 @@ class EnvironmentModel:
                 test_id=row.test_id,
                 test_name=row.test_name,
                 success_count=success_count,
-                failure_count=total_count - success_count,
-                total_count=total_count,
+                failure_count=total_count_minus_flakes - success_count,
+                total_count_minus_flakes=total_count_minus_flakes,
                 flake_count=flake_count,
             )
 

@@ -139,7 +139,7 @@ COLUMN_FLAKE_COUNT = 'flake_count'
 
 def report(request):
 
-    def insufficient_sanitization(parameter_name: str, parameter_default: Optional[str]=None) -> Optional[str]:
+    def insufficient_sanitization(parameter_name: str, parameter_default: Optional[str] = None) -> Optional[str]:
         val = request.GET.get(parameter_name, parameter_default)
         if val is not None and ("'" in val or '"' in val or '\\' in val):
             raise IOError('Sanitization failure')
@@ -163,6 +163,7 @@ def report(request):
     target_network_name = insufficient_sanitization('network', None)
     group_by = insufficient_sanitization('group_by', None)
     target_environment_name = insufficient_sanitization('environment', None)
+    from_index_flag = insufficient_sanitization('from_index', "0")
 
     j = Junit
     pqb = select(

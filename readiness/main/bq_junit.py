@@ -79,7 +79,7 @@ TestName = str
 
 
 class TestRecordAssessment(Enum):
-    EXTREME_REGRESSION = (-3, 'Extreme regression', 'fire.png')
+    EXTREME_REGRESSION = (-3, 'Regression with >15% pass rate change', 'fire.png')
     SIGNIFICANT_REGRESSION = (-2, 'Significant regression', 'red.png')
     MISSING_IN_SAMPLE = (-1, 'No test runs in sample', 'red-question-mark.png')
     NOT_SIGNIFICANT = (0, 'No significant deviation', 'green.png')

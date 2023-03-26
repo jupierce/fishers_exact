@@ -97,18 +97,11 @@
                 var sample_end_dt = $("#sample_end_dt").val();
 
                 var group_by = ""
-                if ( $("#gbc-cloud").is(':checked') ) {
-                    group_by += "cloud,"
-                }
-                if ( $("#gbc-arch").is(':checked') ) {
-                    group_by += "arch,"
-                }
-                if ( $("#gbc-network").is(':checked') ) {
-                    group_by += "network,"
-                }
-                if ( $("#gbc-upgrade").is(':checked') ) {
-                    group_by += "upgrade,"
-                }
+                $(".group-by-checkbox").each(function() {
+                    if ($(this).is(':checked')) {
+                        group_by += $(this).val() + ",";
+                    }
+                })
 
                 if (!basis_start_dt || !basis_end_dt || !sample_start_dt || !sample_end_dt || group_by == "") {
                     return;
@@ -225,16 +218,16 @@
         <h3>Group By</h3>
         <div>
             <label for="gbc-cloud">Cloud</label>
-            <input type="checkbox" name="checkbox-1" id="gbc-cloud" checked="checked">
+            <input class="group-by-checkbox" type="checkbox" name="checkbox-1" id="gbc-cloud" value="cloud" checked="checked">
             <label for="gbc-arch">Arch</label>
-            <input type="checkbox" name="checkbox-2" id="gbc-arch" checked="checked">
+            <input class="group-by-checkbox"  type="checkbox" name="checkbox-2" id="gbc-arch" value="arch" checked="checked">
 
             <br>
 
             <label for="gbc-network">Network</label>
-            <input type="checkbox" name="checkbox-3" id="gbc-network" checked="checked">
+            <input class="group-by-checkbox"  type="checkbox" name="checkbox-3" id="gbc-network" value="network" checked="checked">
             <label for="gbc-upgrade">Upgrade</label>
-            <input type="checkbox" name="checkbox-4" id="gbc-upgrade">
+            <input class="group-by-checkbox"  type="checkbox" name="checkbox-4" id="gbc-upgrade" value="upgrade">
         </div>
         <h3>Section 2</h3>
         <div>

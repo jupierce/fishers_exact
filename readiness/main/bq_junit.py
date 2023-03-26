@@ -204,6 +204,9 @@ class TestRecordSet:
     def get_test_record(self, test_id: TestId) -> TestRecord:
         return self.test_records.get(test_id, None)
 
+    def get_test_records(self) -> List[TestRecord]:
+        return list(self.test_records.values())
+
     def add_test_record(self, test_record: TestRecord):
         if test_record.test_uuid in self.test_records:
             return

@@ -299,12 +299,56 @@ def report(request):
             return HttpResponse(f'No capability parameter was specified')
 
         sample_test_record_set = sample_environment_model.get_environment_test_records(target_environment_name).get_component_test_records(target_component_name).get_capability_test_records(target_capability_name).get_test_record_set(target_test_id)
+        context['environment'] = target_environment_name
+        context['component'] = target_component_name
+        context['capability'] = target_capability_name
+        context['test_id'] = target_test_id
+
         uuid_count = len(sample_test_record_set.test_records)
         if uuid_count > 1:
             # There are more than one test uuids that have been grouped into this test record set,
             # so provide a UI that allows the user to view each UUID and drill to the one they
             # want more information for.
-            pass  # TODO: Implement
+
+            test_record_summary: List[Dict] = list()
+            extra_columns = [
+                ('platform', tables.Column()),
+                ('arch', tables.Column()),
+                ('network', tables.Column()),
+                ('upgrade', tables.Column()),
+                ('status', ImageColumn())
+            ]
+
+            for test_record in sorted(sample_test_record_set.get_test_records(), key=lambda x: x.test_uuid):
+
+                env_attributes: Dict = {
+                    'platform': test_record.platform,
+                    'arch': test_record.arch,
+                    'network': test_record.network,
+                    'upgrade': test_record.upgrade,
+                }
+                href_params = dict(context)
+                href_params.update(env_attributes)
+                href_params['test_uuid'] = test_record.test_uuid
+
+                row = {
+                    'name': test_record.test_name,
+                    'status': AssessmentImageColumnLink(
+                        test_record.cached_assessment,
+                        href_params=dict(href_params)
+                    )
+                }
+                row.update(env_attributes)
+
+                test_record_summary.append(row)
+
+            table = AllComponentsTable(test_record_summary,
+                                       extra_columns=extra_columns,
+                                       )
+            context['table'] = table
+            context['breadcrumb'] = f'{target_environment_name} > {target_component_name} > {target_capability_name} > Disambiguate'
+            return render(request, 'main/report-table.html', context)
+
         elif uuid_count == 1:
             # There is only one test uuid associated with this test record set. Send the user
             # straight to the UI for the specific uuid.

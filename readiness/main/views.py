@@ -161,9 +161,10 @@ def report(request):
     target_upgrade_name = insufficient_sanitization('upgrade', None)
     target_arch_name = insufficient_sanitization('arch', None)
     target_network_name = insufficient_sanitization('network', None)
-    group_by = insufficient_sanitization('group_by', None)
+    group_by_param = insufficient_sanitization('group_by', None)
     target_environment_name = insufficient_sanitization('environment', None)
-    from_index_flag = insufficient_sanitization('from_index', "0")
+    exclude_platforms_param = insufficient_sanitization('exclude_platforms', None)
+    exclude_arches_param = insufficient_sanitization('exclude_arches', None)
 
     j = Junit
     pqb = select(
@@ -217,6 +218,22 @@ def report(request):
             j.test_id == target_test_id
         )
 
+    if exclude_platforms_param:
+        for exclude_prefix in exclude_platforms_param.split(','):
+            if not exclude_prefix:
+                continue
+            pqb = pqb.filter(
+                j.platform.notlike(f'{exclude_prefix}%')
+            )
+
+    if exclude_arches_param:
+        for exclude_name in exclude_arches_param.split(','):
+            if not exclude_name:
+                continue
+            pqb = pqb.filter(
+                j.arch != exclude_name
+            )
+
     # q = f'''
     #     SELECT CONCAT(network, " ", upgrade, " ", arch, " ", platform) as nurp, test_id, ANY_VALUE(test_name) as test_name, COUNT(*) as total_count, SUM(success_val) as success_count, SUM(flake_count) as flake_count
     #     FROM `openshift-gce-devel.ci_analysis_us.junit`
@@ -254,8 +271,8 @@ def report(request):
     executor = ThreadPoolExecutor(2)
     basis_environment_model = EnvironmentModel()
     sample_environment_model = EnvironmentModel()
-    basis_future = executor.submit(basis_environment_model.read_in_query, basis_query, group_by)
-    sample_future = executor.submit(sample_environment_model.read_in_query, sample_query, group_by)
+    basis_future = executor.submit(basis_environment_model.read_in_query, basis_query, group_by_param)
+    sample_future = executor.submit(sample_environment_model.read_in_query, sample_query, group_by_param)
     basis_future.result()
     sample_future.result()
     sample_environment_model.build_mass_assessment_cache(basis_environment_model)
@@ -269,7 +286,7 @@ def report(request):
         'sample_release': sample_release,
         'sample_start_dt': sample_start_dt,
         'sample_end_dt': sample_end_dt,
-        'group_by': group_by,
+        'group_by': group_by_param,
     }
 
     if target_platform_name:

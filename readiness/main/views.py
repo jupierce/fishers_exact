@@ -165,6 +165,8 @@ def report(request):
     target_environment_name = insufficient_sanitization('environment', None)
     exclude_platforms_param = insufficient_sanitization('exclude_platforms', None)
     exclude_arches_param = insufficient_sanitization('exclude_arches', None)
+    exclude_networks_param = insufficient_sanitization('exclude_networks', None)
+    exclude_upgrades_param = insufficient_sanitization('exclude_upgrades', None)
 
     j = Junit
     pqb = select(
@@ -232,6 +234,27 @@ def report(request):
                 continue
             pqb = pqb.filter(
                 j.arch != exclude_name
+            )
+
+    if exclude_networks_param:
+        for exclude_name in exclude_networks_param.split(','):
+            if not exclude_name:
+                continue
+            pqb = pqb.filter(
+                j.network != exclude_name
+            )
+
+    if exclude_upgrades_param:
+        upgrade_name_db_mapping = {
+            'install': '',
+            'minor': 'upgrade-minor',
+            'micro': 'upgrade-micro',
+        }
+        for exclude_name in exclude_upgrades_param.split(','):
+            if not exclude_name or exclude_name not in upgrade_name_db_mapping:
+                continue
+            pqb = pqb.filter(
+                j.upgrade != upgrade_name_db_mapping[exclude_name]
             )
 
     # q = f'''

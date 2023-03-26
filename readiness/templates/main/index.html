@@ -127,6 +127,27 @@
                     optional_params += '&exclude_arches=' + exclude_arches;
                 }
 
+                var exclude_networks = ""
+                $(".exclude-network-checkbox").each(function() {
+                    if ($(this).is(':checked')) {
+                        exclude_networks += $(this).val() + ",";
+                    }
+                })
+
+                if (exclude_networks) {
+                    optional_params += '&exclude_networks=' + exclude_networks;
+                }
+
+                var exclude_upgrades = ""
+                $(".exclude-upgrade-checkbox").each(function() {
+                    if ($(this).is(':checked')) {
+                        exclude_upgrades += $(this).val() + ",";
+                    }
+                })
+
+                if (exclude_upgrades) {
+                    optional_params += '&exclude_upgrades=' + exclude_upgrades;
+                }
 
                 if (!basis_start_dt || !basis_end_dt || !sample_start_dt || !sample_end_dt || group_by == "") {
                     return;
@@ -187,7 +208,9 @@
                 $("#sample_end_dt").val(date_to_dt(now));
                 // showReport();
 
-                $( "#accordion" ).accordion();
+                $( "#accordion" ).accordion({
+                    heightStyle: "content"
+                });
             } );
 
 
@@ -254,7 +277,8 @@
             <label for="gbc-upgrade">Upgrade</label>
             <input class="group-by-checkbox"  type="checkbox" id="gbc-upgrade" value="upgrade">
         </div>
-        <h3>Exclude Cloud</h3>
+
+        <h3>Exclude Clouds</h3>
         <div>
             <label for="ip-aws">AWS</label>
             <input class="exclude-platform-checkbox" type="checkbox" id="ip-aws" value="aws">
@@ -287,7 +311,8 @@
             <input class="exclude-platform-checkbox" type="checkbox" id="ip-unknown" value="unknown">
 
         </div>
-        <h3>Exclude Arch</h3>
+
+        <h3>Exclude Arches</h3>
         <div>
             <label for="ia-amd64">amd64</label>
             <input class="exclude-arch-checkbox" type="checkbox" id="ia-amd64" value="amd64">
@@ -302,34 +327,30 @@
             <input class="exclude-arch-checkbox" type="checkbox" id="ia-s390x" value="s390x">
         </div>
 
+        <h3>Exclude Networks</h3>
+        <div>
+            <label for="in-ovn">ovn</label>
+            <input class="exclude-network-checkbox" type="checkbox" id="in-ovn" value="ovn">
 
-        <h3>Section 3</h3>
-        <div>
-            <p>
-                Nam enim risus, molestie et, porta ac, aliquam ac, risus. Quisque lobortis.
-                Phasellus pellentesque purus in massa. Aenean in pede. Phasellus ac libero
-                ac tellus pellentesque semper. Sed ac felis. Sed commodo, magna quis
-                lacinia ornare, quam ante aliquam nisi, eu iaculis leo purus venenatis dui.
-            </p>
-            <ul>
-                <li>List item one</li>
-                <li>List item two</li>
-                <li>List item three</li>
-            </ul>
+            <label for="in-sdn">sdn</label>
+            <input class="exclude-network-checkbox" type="checkbox" id="in-sdn" value="sdn">
         </div>
-        <h3>Section 4</h3>
+
+        <h3>Exclude Upgrades</h3>
         <div>
-            <p>
-                Cras dictum. Pellentesque habitant morbi tristique senectus et netus
-                et malesuada fames ac turpis egestas. Vestibulum ante ipsum primis in
-                faucibus orci luctus et ultrices posuere cubilia Curae; Aenean lacinia
-                mauris vel est.
-            </p>
-            <p>
-                Suspendisse eu nisl. Nullam ut libero. Integer dignissim consequat lectus.
-                Class aptent taciti sociosqu ad litora torquent per conubia nostra, per
-                inceptos himenaeos.
-            </p>
+            <label for="iu-install">No Upgrade</label>
+            <input class="exclude-upgrade-checkbox" type="checkbox" id="iu-install" value="install">
+            <label for="iu-minor">Y-Stream Upgrade</label>
+            <br>
+            <input class="exclude-upgrade-checkbox" type="checkbox" id="iu-minor" value="minor">
+            <label for="iu-micro">Z-Stream Upgrade</label>
+            <input class="exclude-upgrade-checkbox" type="checkbox" id="iu-micro" value="micro">
+        </div>
+
+
+        <h3>Advanced</h3>
+        <div>
+            <p>Ignore no samples found</p>
         </div>
     </div>
 

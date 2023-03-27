@@ -84,7 +84,7 @@ class TestRecordAssessment(Enum):
     MISSING_IN_SAMPLE = (-1, 'No test runs in sample', 'red-question-mark.png')
     NOT_SIGNIFICANT = (0, 'No significant deviation', 'green.png')
     MISSING_IN_BASIS = (1, 'No records in basis data', 'green.png')
-    SIGNIFICANT_IMPROVEMENT = (2, 'Significant improvement', 'green-heart.png')
+    SIGNIFICANT_IMPROVEMENT = (2, 'Significant improvement', 'darkgreen-heart.png')
 
     def __init__(self, val: int, description: str, image_path: str):
         self.val = val
@@ -173,13 +173,22 @@ class TestRecord:
             sample_pass_percentage = self.success_count / self.total_count_minus_flakes
             improved = sample_pass_percentage >= basis_pass_percentage
 
-            significant = fisher_significant(
-                self.failure_count,
-                self.success_count,
-                basis_test_record.failure_count,
-                basis_test_record.success_count,
-                alpha=alpha,
-            )
+            if improved:
+                significant = fisher_significant(
+                    basis_test_record.failure_count,
+                    basis_test_record.success_count,
+                    self.failure_count,
+                    self.success_count,
+                    alpha=alpha,
+                )
+            else:
+                significant = fisher_significant(
+                    self.failure_count,
+                    self.success_count,
+                    basis_test_record.failure_count,
+                    basis_test_record.success_count,
+                    alpha=alpha,
+                )
 
             if significant:
                 if improved:

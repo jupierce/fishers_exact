@@ -450,7 +450,7 @@ def report(request):
         context['fishers_exact'] = str(fast_fisher.fast_fisher_cython.fisher_exact(
             sample_test_record.failure_count, sample_test_record.success_count,
             basis_test_record.failure_count, basis_test_record.success_count,
-            alternative='greater'
+            alternative='greater' if sample_test_record.assessment() != TestRecordAssessment.SIGNIFICANT_IMPROVEMENT else 'less'
         ))
 
         base_test_query = select(

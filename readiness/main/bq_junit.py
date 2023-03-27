@@ -155,7 +155,7 @@ class TestRecord:
             return TestRecordAssessment.MISSING_IN_BASIS
         return self.cached_assessment
 
-    def compute_assessment(self, basis_test_record: "TestRecord", alpha: float, regression_when_missing: bool):
+    def compute_assessment(self, basis_test_record: "TestRecord", alpha: float, regression_when_missing: bool, pity_factor: float = 0.05):
         if self.cached_assessment:
             # Already assessed
             return
@@ -182,13 +182,18 @@ class TestRecord:
                     alpha=alpha,
                 )
             else:
-                significant = fisher_significant(
-                    self.failure_count,
-                    self.success_count,
-                    basis_test_record.failure_count,
-                    basis_test_record.success_count,
-                    alpha=alpha,
-                )
+                if basis_pass_percentage - sample_pass_percentage < pity_factor:
+                    # Until the difference in pass rate has decreased beyond the pity
+                    # factory, allow the square to remain green.
+                    significant = False
+                else:
+                    significant = fisher_significant(
+                        self.failure_count,
+                        self.success_count,
+                        basis_test_record.failure_count,
+                        basis_test_record.success_count,
+                        alpha=alpha,
+                    )
 
             if significant:
                 if improved:
@@ -359,7 +364,7 @@ class EnvironmentTestRecords:
     def assessment(self) -> TestRecordAssessment:
         return TestRecord.aggregate_assessment([ctr.assessment() for ctr in self.component_test_records.values()])
 
-    def build_mass_assessment_cache(self, basis_environment_test_records: "EnvironmentTestRecords", alpha: float, regression_when_missing: bool):
+    def build_mass_assessment_cache(self, basis_environment_test_records: "EnvironmentTestRecords", alpha: float, regression_when_missing: bool, pity_factor: float = 0.05):
 
         basis_test_uuids = set(basis_environment_test_records.all_test_record_uuids)
         sample_test_uuids = set(self.all_test_record_uuids)
@@ -384,7 +389,7 @@ class EnvironmentTestRecords:
         for test_uuid, sample_test_record in self.all_test_records.items():
             if test_uuid in basis_environment_test_records.all_test_records:
                 basis_test_record = basis_environment_test_records.all_test_records[test_uuid]
-                sample_test_record.compute_assessment(basis_test_record, alpha, regression_when_missing)
+                sample_test_record.compute_assessment(basis_test_record, alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)
             else:
                 sample_test_record.cached_assessment = TestRecordAssessment.MISSING_IN_BASIS
 
@@ -460,7 +465,7 @@ class EnvironmentModel:
             component_name_modified = environment_test_records.add_test_record(r)
             self.all_component_names.update(component_name_modified)
 
-    def build_mass_assessment_cache(self, basis_model: "EnvironmentModel", alpha: float = 0.05, regression_when_missing: bool=True):
+    def build_mass_assessment_cache(self, basis_model: "EnvironmentModel", alpha: float = 0.05, regression_when_missing: bool = True, pity_factor: float = 0.05):
 
         # Get a list of all environments - including both basis and sample in case
         # there is one in basis that no longer exists in samples.
@@ -470,4 +475,4 @@ class EnvironmentModel:
         for environment_name in all_names:
             sample_environment_test_records = self.get_environment_test_records(environment_name)
             basis_environment_test_records = basis_model.get_environment_test_records(environment_name)
-            sample_environment_test_records.build_mass_assessment_cache(basis_environment_test_records, alpha, regression_when_missing)
+            sample_environment_test_records.build_mass_assessment_cache(basis_environment_test_records, alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)

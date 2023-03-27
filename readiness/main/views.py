@@ -156,6 +156,9 @@ def report(request):
     confidence_param = insufficient_sanitization("confidence", "95")
     fisher_alpha: float = (100 - int(confidence_param)) / 100
 
+    pity_param = insufficient_sanitization("pity", "5")
+    pity_factor: float = int(pity_param) / 100
+
     missing_samples_param = insufficient_sanitization("missing", "ok")
     regression_when_missing = missing_samples_param != "ok"
 
@@ -306,7 +309,7 @@ def report(request):
     sample_future = executor.submit(sample_environment_model.read_in_query, sample_query, group_by_param)
     basis_future.result()
     sample_future.result()
-    sample_environment_model.build_mass_assessment_cache(basis_environment_model, alpha=fisher_alpha, regression_when_missing=regression_when_missing)
+    sample_environment_model.build_mass_assessment_cache(basis_environment_model, alpha=fisher_alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)
 
     ordered_environment_names: List[EnvironmentName] = sorted(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names()))
 
@@ -331,6 +334,9 @@ def report(request):
 
     if confidence_param != "95":
         context['confidence'] = confidence_param
+
+    if pity_param != "5":
+        context['pity'] = pity_param
 
     if missing_samples_param != "ok":
         context['missing'] = missing_samples_param

@@ -81,6 +81,15 @@
                 line-height: 1.6em;
             }
 
+            #pity-handle {
+                width: 3em;
+                height: 1.6em;
+                top: 50%;
+                margin-top: -.8em;
+                text-align: center;
+                line-height: 1.6em;
+            }
+
     </style>
 
     <script>
@@ -117,6 +126,11 @@
                 var confidence = $("#confidence-val").val()
                 if (confidence != "95") {
                     optional_params += '&confidence=' + confidence;
+                }
+
+                var pity = $("#pity-val").val()
+                if (pity != "5") {
+                    optional_params += '&pity=' + pity;
                 }
 
                 if (!$("#ignore-missing-sample").is(':checked')) {
@@ -241,6 +255,22 @@
                     slide: function( event, ui ) {
                         handle.text( ui.value + "%" );
                         $("#confidence-val").val(""+ui.value);
+                    }
+                });
+
+                var pity_handle = $( "#pity-handle" );
+                $( "#pity-slider" ).slider({
+                    min: 0,
+                    max: 10,
+                    value: 5,
+                    create: function() {
+                        var val = $( this ).slider( "value" );
+                        pity_handle.text( val + "%" );
+                        $("#pity-val").val(""+val);
+                    },
+                    slide: function( event, ui ) {
+                        pity_handle.text( ui.value + "%" );
+                        $("#pity-val").val(""+ui.value);
                     }
                 });
 
@@ -393,6 +423,13 @@
             </div>
             <!-- bug in slider when calling for value after another div loads. Store val in hidden field so we can query it here. -->
             <input type="hidden" id="confidence-val" value="95" />
+
+            Eads' Factor
+            <div id="pity-slider" style="margin:5%;">
+                <div id="pity-handle" class="ui-slider-handle"></div>
+            </div>
+            <!-- bug in slider when calling for value after another div loads. Store val in hidden field so we can query it here. -->
+            <input type="hidden" id="pity-val" value="95" />
 
             <p>Tests missing in Sample</p>
             <label for="ignore-missing-sample">Ignore</label>

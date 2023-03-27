@@ -13,6 +13,7 @@
         <link rel="stylesheet" href="{% static 'main/jquery-ui/jquery-ui.theme.min.css' %}">
         <link href="{% static 'django_tables2/themes/paleblue/css/screen.css' %}" rel="stylesheet">
         <script src="{% static 'main/jquery-ui/jquery-ui.min.js' %}"></script>
+
 </head>
 
 <body>
@@ -20,6 +21,9 @@
 <br>
 
 {% render_table table %}
+
+<br><br>
+<a id="self-link" href="">Report Link<span class="ui-icon ui-icon-link"></span></a>
 
 </body>
 

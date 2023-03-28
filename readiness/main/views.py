@@ -83,10 +83,11 @@ def _render_prowjob_rows(rows) -> str:
         failure_iterations = max(0, row['total_count'] - row['flake_count'] - row['success_count'])
         flake_iterations = row['flake_count']
         success_iterations = max(0, row['success_count'] - row['flake_count'])
+        spyglass_path = 'https://prow.ci.openshift.org/view/gs/origin-ci-test/' + row["file_path"].split('/artifacts/')[0]
 
         char_entries: List[str] = (['S'] * success_iterations) + (['s'] * flake_iterations) + (['F'] * failure_iterations)
         for outcome_char in char_entries:
-            result += f'<a class="outcome_{outcome_char}" href="https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/origin-ci-test/{row["file_path"]}">{outcome_char}</a> '
+            result += f'<a class="outcome_{outcome_char}" href="{spyglass_path}/">{outcome_char}</a> '
             char_count += 1
             if char_count % 20 == 0:
                 result += '<br>'

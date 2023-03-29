@@ -450,7 +450,6 @@ class EnvironmentModel:
             raise IOError('Invalid group-by values')
 
         for row in query.execute():
-
             env_attributes: Dict[str, str] = dict()
             env_name_components: List[str] = list()  # order of this list reflects in column heading names
             if group_by_platform:

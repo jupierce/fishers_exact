@@ -11,6 +11,7 @@ from .fishers import fisher_significant
 
 import fast_fisher.fast_fisher_cython
 
+from sqlalchemy import text
 
 from django.shortcuts import render
 
@@ -194,9 +195,9 @@ def report(request):
         j.platform,
         j.test_id,
         j.flat_variants,
-        concat(any_value(j.testsuite), ":", any_value(j.test_name)).label(COLUMN_TEST_NAME),
         any_value(j.testsuite).label(COLUMN_TESTSUITE),
         count(j.test_id).label(COLUMN_TOTAL_COUNT),
+        concat(any_value(j.testsuite), ":", any_value(j.test_name)).label(COLUMN_TEST_NAME),
         sum(j.success_val).label(COLUMN_SUCCESS_COUNT),
         sum(j.flake_count).label(COLUMN_FLAKE_COUNT),
     ).group_by(
@@ -281,7 +282,7 @@ def report(request):
     if exclude_upgrades_param:
         context['exclude_upgrades'] = exclude_upgrades_param
         upgrade_name_db_mapping = {
-            'install': '',
+            'install': 'none',
             'minor': 'upgrade-minor',
             'micro': 'upgrade-micro',
         }

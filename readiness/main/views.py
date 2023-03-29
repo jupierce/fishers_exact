@@ -6,7 +6,7 @@ from django.utils.html import format_html
 from django.http import HttpResponse
 import django_tables2 as tables
 
-from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId
+from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId, concat, array_to_string
 from .fishers import fisher_significant
 
 import fast_fisher.fast_fisher_cython
@@ -83,11 +83,13 @@ def _render_prowjob_rows(rows) -> str:
         failure_iterations = max(0, row['total_count'] - row['flake_count'] - row['success_count'])
         flake_iterations = row['flake_count']
         success_iterations = max(0, row['success_count'] - row['flake_count'])
-        spyglass_path = 'https://prow.ci.openshift.org/view/gs/origin-ci-test/' + row["file_path"].split('/artifacts/')[0]
+        artifacts_split = row["file_path"].split('/artifacts/', 1)
+        spyglass_path = 'https://prow.ci.openshift.org/view/gs/origin-ci-test/' + artifacts_split[0]
+        junit_file_path = '' if len(artifacts_split) == 1 else artifacts_split[1]
 
         char_entries: List[str] = (['S'] * success_iterations) + (['s'] * flake_iterations) + (['F'] * failure_iterations)
         for outcome_char in char_entries:
-            result += f'<a class="outcome_{outcome_char}" href="{spyglass_path}/">{outcome_char}</a> '
+            result += f'<a class="outcome_{outcome_char}" href="{spyglass_path}/" title="{junit_file_path}" alt="{junit_file_path}">{outcome_char}</a> '
             char_count += 1
             if char_count % 20 == 0:
                 result += '<br>'
@@ -133,6 +135,7 @@ class AllComponentsTable(tables.Table):
 
 
 COLUMN_TEST_NAME = 'test_name'
+COLUMN_TESTSUITE = 'testsuite'
 COLUMN_TOTAL_COUNT = 'total_count'
 COLUMN_SUCCESS_COUNT = 'success_count'
 COLUMN_FLAKE_COUNT = 'flake_count'
@@ -187,7 +190,8 @@ def report(request):
         j.arch,
         j.platform,
         j.test_id,
-        any_value(j.test_name).label(COLUMN_TEST_NAME),
+        concat(any_value(j.testsuite), ":", any_value(j.test_name)).label(COLUMN_TEST_NAME),
+        any_value(j.testsuite).label(COLUMN_TESTSUITE),
         count(j.test_id).label(COLUMN_TOTAL_COUNT),
         sum(j.success_val).label(COLUMN_SUCCESS_COUNT),
         sum(j.flake_count).label(COLUMN_FLAKE_COUNT),
@@ -449,7 +453,8 @@ def report(request):
                 upgrade=sample_test_record.upgrade,
                 arch=sample_test_record.arch,
                 test_id=sample_test_record.test_id,
-                test_name=sample_test_record.test_name
+                test_name=sample_test_record.test_name,
+                testsuite=sample_test_record.testsuite,
             )
 
         context['sample_test'] = sample_test_record

@@ -52,6 +52,8 @@ class Junit(Base):
     upgrade = __table__.c.upgrade
     variants = __table__.c.variants
     flake_count = __table__.c.flake_count
+    flat_variants = __table__.c.flat_variants
+    testsuite = __table__.c.testsuite
 
     @classmethod
     def platform_drill_key(cls) -> func.GenericFunction:
@@ -68,13 +70,23 @@ class Junit(Base):
 select = expression.select
 any_value = func.any_value
 count = func.count
+concat = func.concat
+array_to_string = func.array_to_string
 sum = func.sum
 
 EnvironmentName = str
 ComponentName = str
 CapabilityName = str
-TestUUID = str
+
+# When a typical user should have the concept of a test being the "same test", the
+# test ids for individual test runs should match. Initially, this was identical to the
+# test's name, but complexities were discovered:
+# - If a test with the same name is run in two different suites, it should result in different test ids.
+# - If a test runs on
 TestId = str
+
+
+TestUUID = str
 TestName = str
 
 
@@ -130,6 +142,7 @@ class TestRecord:
                  arch: str,
                  upgrade: str,
                  test_id: TestId,
+                 testsuite: str,
                  test_name: TestName,
                  success_count: int = 0,
                  failure_count: int = 0,
@@ -137,6 +150,7 @@ class TestRecord:
                  flake_count: int = 0,
                  assessment: TestRecordAssessment = None):
         self.test_id = test_id
+        self.testsuite = testsuite
         self.test_name = test_name
         self.success_count = success_count
         self.failure_count = failure_count
@@ -287,8 +301,14 @@ class ComponentTestRecords:
 
     def find_associated_capabilities(self, test_record: TestRecord) -> Iterable[CapabilityName]:
         associated_capabilities: List[CapabilityName] = list()
-        primary_capability_name = test_record.test_id[:1]  # Just a stop gap in place of looking these up from a database
-        if not self.grouping_by_upgrade:
+
+        primary_capability_name = test_record.test_id[-1:]  # Just a stop gap in place of looking these up from a database
+
+        if test_record.testsuite == 'openshift-tests-upgrade':
+            # Deads requests that this testsuite be broken out into its own
+            # capability.
+            associated_capabilities.append(f'openshift-tests-upgrade: {primary_capability_name}')
+        elif not self.grouping_by_upgrade:
             if test_record.upgrade == 'upgrade-minor':
                 associated_capabilities.append(f'y-upgrade: {primary_capability_name}')
             elif test_record.upgrade == 'upgrade-micro':
@@ -381,6 +401,7 @@ class EnvironmentTestRecords:
                 assessment=TestRecordAssessment.MISSING_IN_SAMPLE if regression_when_missing else TestRecordAssessment.NOT_SIGNIFICANT,
                 test_id=basis_test_record.test_id,
                 test_name=basis_test_record.test_name,
+                testsuite=basis_test_record.testsuite,
             )
             # Adding these missing tests ensures that the sample environment has a superset
             # of components and capabilities compared to the basis environment.
@@ -454,6 +475,7 @@ class EnvironmentModel:
                 upgrade=row.upgrade,
                 arch=row.arch,
                 test_id=row.test_id,
+                testsuite=row.testsuite,
                 test_name=row.test_name,
                 success_count=success_count,
                 failure_count=total_count_minus_flakes - success_count,

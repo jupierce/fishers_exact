@@ -141,6 +141,7 @@ class TestRecord:
                  network: str,
                  arch: str,
                  upgrade: str,
+                 flat_variants: str,
                  test_id: TestId,
                  testsuite: str,
                  test_name: TestName,
@@ -162,7 +163,8 @@ class TestRecord:
         self.network = network
         self.arch = arch
         self.upgrade = upgrade
-        self.test_uuid: TestUUID = f'p={platform};n={network};a={arch};u={upgrade};id={test_id}'
+        self.flat_variants = flat_variants
+        self.test_uuid: TestUUID = f'p={platform};n={network};a={arch};u={upgrade};v={flat_variants};id={test_id}'
 
     def assessment(self) -> TestRecordAssessment:
         if self.cached_assessment is None:
@@ -333,7 +335,7 @@ class EnvironmentTestRecords:
 
     COMPONENT_NAME_PATTERN = re.compile(r'\[[^\\]+?\]')
 
-    def __init__(self, name: EnvironmentName, grouping_by_upgrade=False, platform: str = '', arch: str = '', network: str = '', upgrade: str = ''):
+    def __init__(self, name: EnvironmentName, grouping_by_upgrade=False, platform: str = '', arch: str = '', network: str = '', upgrade: str = '', variant: str = ''):
         self.all_test_record_uuids: Set[TestUUID] = set()
         self.name: EnvironmentName = name
         self.grouping_by_upgrade = grouping_by_upgrade
@@ -342,20 +344,21 @@ class EnvironmentTestRecords:
         self.arch = arch
         self.network = network
         self.upgrade = upgrade
+        self.variant = variant
 
         # Within a given environment, results for a specific TestId can be added several times.
         # For example, if the environment is grouping by Platform+Arch+Network, the
         # environment model add to this EnvironmentTestRecords multiple identical TestId values
         # but each will be associated with a different upgrade.
         # So EnvironmentTestRecords work based on TestUUID which is a combination of
-        # NURP+TestID which makes it completely unique for the Environment (i.e. the query
+        # NURPP+TestID which makes it completely unique for the Environment (i.e. the query
         # to the database must be grouping on these attributes to ensure that only a single
         # such row exists in the results).
         # All regression is assessed on TestUUID comparisons between basis and sample.
         self.all_test_records: Dict[TestUUID, TestRecord] = dict()
 
     def get_breadcrumb(self) -> str:
-        return f"[cloud='{self.platform}' arch='{self.arch}' network='{self.network}' upgrade='{self.upgrade}']"
+        return f"[cloud='{self.platform}' arch='{self.arch}' network='{self.network}' upgrade='{self.upgrade}' variant='{self.variant}']"
 
     def get_component_test_records(self, component_name: ComponentName) -> ComponentTestRecords:
         if component_name in self.component_test_records:
@@ -398,6 +401,7 @@ class EnvironmentTestRecords:
                 network=basis_test_record.network,
                 upgrade=basis_test_record.upgrade,
                 arch=basis_test_record.arch,
+                flat_variants=basis_test_record.flat_variants,
                 assessment=TestRecordAssessment.MISSING_IN_SAMPLE if regression_when_missing else TestRecordAssessment.NOT_SIGNIFICANT,
                 test_id=basis_test_record.test_id,
                 test_name=basis_test_record.test_name,
@@ -439,9 +443,10 @@ class EnvironmentModel:
         group_by_network = 'network' in group_by_elements
         group_by_upgrade = 'upgrade' in group_by_elements
         group_by_arch = 'arch' in group_by_elements
+        group_by_variant = 'variant' in group_by_elements
         group_by_platform = 'cloud' in group_by_elements or 'platform' in group_by_elements
 
-        if not any((group_by_network, group_by_upgrade, group_by_arch, group_by_platform)):
+        if not any((group_by_network, group_by_upgrade, group_by_arch, group_by_platform, group_by_variant)):
             raise IOError('Invalid group-by values')
 
         for row in query.execute():
@@ -460,6 +465,9 @@ class EnvironmentModel:
             if group_by_upgrade:
                 env_attributes['upgrade'] = row.upgrade
                 env_name_components.append(row.upgrade)
+            if group_by_variant:
+                env_attributes['variant'] = row.flat_variants
+                env_name_components.append(row.flat_variants)
 
             env_name = ' '.join(env_name_components)
             flake_count = row.flake_count
@@ -473,6 +481,7 @@ class EnvironmentModel:
                 platform=row.platform,
                 network=row.network,
                 upgrade=row.upgrade,
+                flat_variants=row.flat_variants,
                 arch=row.arch,
                 test_id=row.test_id,
                 testsuite=row.testsuite,

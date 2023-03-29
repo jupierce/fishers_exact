@@ -136,6 +136,7 @@ class AllComponentsTable(tables.Table):
 
 COLUMN_TEST_NAME = 'test_name'
 COLUMN_TESTSUITE = 'testsuite'
+COLUMN_FLAT_VARIANTS = 'flat_variants'
 COLUMN_TOTAL_COUNT = 'total_count'
 COLUMN_SUCCESS_COUNT = 'success_count'
 COLUMN_FLAKE_COUNT = 'flake_count'
@@ -173,6 +174,7 @@ def report(request):
     target_platform_name = insufficient_sanitization('platform', None)
     target_upgrade_name = insufficient_sanitization('upgrade', None)
     target_arch_name = insufficient_sanitization('arch', None)
+    target_variant_name = insufficient_sanitization('variant', None)
     target_network_name = insufficient_sanitization('network', None)
     target_environment_name = insufficient_sanitization('environment', None)
 
@@ -182,6 +184,7 @@ def report(request):
     exclude_arches_param = insufficient_sanitization('exclude_arches', None)
     exclude_networks_param = insufficient_sanitization('exclude_networks', None)
     exclude_upgrades_param = insufficient_sanitization('exclude_upgrades', None)
+    exclude_variants_param = insufficient_sanitization('exclude_variants', None)
 
     j = Junit
     pqb = select(
@@ -190,17 +193,19 @@ def report(request):
         j.arch,
         j.platform,
         j.test_id,
+        j.flat_variants,
         concat(any_value(j.testsuite), ":", any_value(j.test_name)).label(COLUMN_TEST_NAME),
         any_value(j.testsuite).label(COLUMN_TESTSUITE),
         count(j.test_id).label(COLUMN_TOTAL_COUNT),
         sum(j.success_val).label(COLUMN_SUCCESS_COUNT),
         sum(j.flake_count).label(COLUMN_FLAKE_COUNT),
     ).group_by(
+        j.test_id,
+        j.platform,
         j.network,
         j.upgrade,
         j.arch,
-        j.platform,
-        j.test_id,
+        j.flat_variants,
     )
 
     def assert_all_set(lt: Iterable, error_msg: str):
@@ -210,6 +215,16 @@ def report(request):
     assert_all_set((basis_start_dt, basis_end_dt, basis_release), 'At least one basis coordinate has not been specified')
 
     assert_all_set((sample_start_dt, sample_end_dt, sample_release), 'At least one sample coordinate has not been specified')
+
+    context = {
+        'basis_release': basis_release,
+        'basis_start_dt': basis_start_dt,
+        'basis_end_dt': basis_end_dt,
+        'sample_release': sample_release,
+        'sample_start_dt': sample_start_dt,
+        'sample_end_dt': sample_end_dt,
+        'group_by': group_by_param,
+    }
 
     if target_upgrade_name:
         pqb = pqb.filter(
@@ -237,14 +252,16 @@ def report(request):
         )
 
     if exclude_platforms_param:
-        for exclude_prefix in exclude_platforms_param.split(','):
-            if not exclude_prefix:
+        context['exclude_platforms'] = exclude_platforms_param
+        for exclude_element in exclude_platforms_param.split(','):
+            if not exclude_element:
                 continue
             pqb = pqb.filter(
-                j.platform.notlike(f'{exclude_prefix}%')
+                j.platform.notlike(f'{exclude_element}%')
             )
 
     if exclude_arches_param:
+        context['exclude_arches'] = exclude_arches_param
         for exclude_name in exclude_arches_param.split(','):
             if not exclude_name:
                 continue
@@ -253,6 +270,7 @@ def report(request):
             )
 
     if exclude_networks_param:
+        context['exclude_networks'] = exclude_networks_param
         for exclude_name in exclude_networks_param.split(','):
             if not exclude_name:
                 continue
@@ -261,6 +279,7 @@ def report(request):
             )
 
     if exclude_upgrades_param:
+        context['exclude_upgrades'] = exclude_upgrades_param
         upgrade_name_db_mapping = {
             'install': '',
             'minor': 'upgrade-minor',
@@ -271,6 +290,15 @@ def report(request):
                 continue
             pqb = pqb.filter(
                 j.upgrade != upgrade_name_db_mapping[exclude_name]
+            )
+
+    if exclude_variants_param:
+        context['exclude_variants'] = exclude_variants_param
+        for exclude_element in exclude_variants_param.split(','):
+            if not exclude_element:
+                continue
+            pqb = pqb.filter(
+                j.flat_variants.notlike(f'%{exclude_element}%')
             )
 
     # q = f'''
@@ -318,16 +346,6 @@ def report(request):
 
     ordered_environment_names: List[EnvironmentName] = sorted(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names()))
 
-    context = {
-        'basis_release': basis_release,
-        'basis_start_dt': basis_start_dt,
-        'basis_end_dt': basis_end_dt,
-        'sample_release': sample_release,
-        'sample_start_dt': sample_start_dt,
-        'sample_end_dt': sample_end_dt,
-        'group_by': group_by_param,
-    }
-
     if target_platform_name:
         context['platform'] = target_platform_name
     if target_network_name:
@@ -336,6 +354,8 @@ def report(request):
         context['upgrade'] = target_upgrade_name
     if target_arch_name:
         context['arch'] = target_arch_name
+    if target_variant_name:
+        context['variant'] = target_variant_name
 
     if confidence_param != "95":
         context['confidence'] = confidence_param
@@ -355,6 +375,8 @@ def report(request):
             link_context['upgrade'] = environment_test_records.upgrade
         if environment_test_records.arch:
             link_context['arch'] = environment_test_records.arch
+        if environment_test_records.variant:
+            link_context['variant'] = environment_test_records.variant
 
     if target_test_id:  # Rendering a specifically requested TestRecordSet test_id
         if not target_environment_name:
@@ -382,6 +404,7 @@ def report(request):
                 ('arch', tables.Column()),
                 ('network', tables.Column()),
                 ('upgrade', tables.Column()),
+                ('variant', tables.Column()),
                 ('status', ImageColumn())
             ]
 
@@ -392,6 +415,7 @@ def report(request):
                     'arch': test_record.arch,
                     'network': test_record.network,
                     'upgrade': test_record.upgrade,
+                    'variant': test_record.flat_variants,
                 }
                 href_params = dict(context)
                 href_params.update(env_attributes)
@@ -452,6 +476,7 @@ def report(request):
                 network=sample_test_record.network,
                 upgrade=sample_test_record.upgrade,
                 arch=sample_test_record.arch,
+                flat_variants=sample_test_record.flat_variants,
                 test_id=sample_test_record.test_id,
                 test_name=sample_test_record.test_name,
                 testsuite=sample_test_record.testsuite,
@@ -476,6 +501,7 @@ def report(request):
             j.network == sample_test_record.network,
             j.upgrade == sample_test_record.upgrade,
             j.arch == sample_test_record.arch,
+            j.flat_variants == sample_test_record.flat_variants,
             j.test_id == sample_test_record.test_id
         ).group_by(
             j.file_path,

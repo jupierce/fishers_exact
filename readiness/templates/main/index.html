@@ -181,6 +181,17 @@
                     optional_params += '&exclude_upgrades=' + exclude_upgrades;
                 }
 
+                var exclude_variants = ""
+                $(".exclude-variant-checkbox").each(function() {
+                    if ($(this).is(':checked')) {
+                        exclude_variants += $(this).val() + ",";
+                    }
+                })
+
+                if (exclude_variants) {
+                    optional_params += '&exclude_variants=' + exclude_variants;
+                }
+
                 if (!basis_start_dt || !basis_end_dt || !sample_start_dt || !sample_end_dt || group_by == "") {
                     return;
                 }
@@ -342,6 +353,11 @@
             <input class="group-by-checkbox"  type="checkbox" id="gbc-network" value="network" checked="checked">
             <label for="gbc-upgrade">Upgrade</label>
             <input class="group-by-checkbox"  type="checkbox" id="gbc-upgrade" value="upgrade">
+
+            <br>
+            <label for="gbc-variant">Variant</label>
+            <input class="group-by-checkbox"  type="checkbox" id="gbc-variant" value="variant">
+
         </div>
 
         <h3>Exclude Clouds</h3>
@@ -411,10 +427,49 @@
             <label for="iu-install">No Upgrade</label>
             <input class="exclude-upgrade-checkbox" type="checkbox" id="iu-install" value="install">
             <label for="iu-minor">Y-Stream Upgrade</label>
-            <br>
             <input class="exclude-upgrade-checkbox" type="checkbox" id="iu-minor" value="minor">
             <label for="iu-micro">Z-Stream Upgrade</label>
             <input class="exclude-upgrade-checkbox" type="checkbox" id="iu-micro" value="micro">
+        </div>
+
+        <h3>Exclude Variants</h3>
+        <div>
+            <label for="iv-standard">Standard</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-standard" value="standard">
+            <br>
+
+            <label for="iv-assisted">Assisted</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-assisted" value="assisted">
+
+            <label for="iv-compact">Compact</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-compact" value="compact">
+
+            <label for="iv-fips">FIPS</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-fips" value="fips">
+
+            <label for="iv-hypershift">HyperShift</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-hypershift" value="hypershift">
+
+            <label for="iv-microshift">MicroShift</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-microshift" value="microshift">
+
+            <label for="iv-osd">OSD</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-osd" value="osd">
+
+            <label for="iv-serial">Serial</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-serial" value="serial">
+
+            <label for="iv-proxy">Proxy</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-proxy" value="proxy">
+
+            <label for="iv-rt">Real Time</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-rt" value="rt,realtime">
+
+            <label for="iv-single-node">Single Node</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-single-node" value="single-node">
+
+            <label for="iv-techpreview">Tech Preview</label>
+            <input class="exclude-variant-checkbox" type="checkbox" id="iv-techpreview" value="techpreview">
         </div>
 
 

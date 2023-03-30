@@ -1,4 +1,8 @@
+import multiprocessing
+import traceback
 from concurrent.futures import ThreadPoolExecutor
+
+from multiprocessing import Process
 
 from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable, Set
 
@@ -6,7 +10,7 @@ from django.utils.html import format_html
 from django.http import HttpResponse
 import django_tables2 as tables
 
-from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId, concat, array_to_string
+from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId, concat, array_to_string, _junit_table_engine
 from .fishers import fisher_significant
 
 import fast_fisher.fast_fisher_cython
@@ -135,14 +139,6 @@ class AllComponentsTable(tables.Table):
             return value
 
 
-COLUMN_TEST_NAME = 'test_name'
-COLUMN_TESTSUITE = 'testsuite'
-COLUMN_FLAT_VARIANTS = 'flat_variants'
-COLUMN_TOTAL_COUNT = 'total_count'
-COLUMN_SUCCESS_COUNT = 'success_count'
-COLUMN_FLAKE_COUNT = 'flake_count'
-
-
 def report(request):
 
     def insufficient_sanitization(parameter_name: str, parameter_default: Optional[str] = None) -> Optional[str]:
@@ -188,26 +184,7 @@ def report(request):
     exclude_variants_param = insufficient_sanitization('exclude_variants', None)
 
     j = Junit
-    pqb = select(
-        j.network,
-        j.upgrade,
-        j.arch,
-        j.platform,
-        j.test_id,
-        j.flat_variants,
-        any_value(j.testsuite).label(COLUMN_TESTSUITE),
-        count(j.test_id).label(COLUMN_TOTAL_COUNT),
-        concat(any_value(j.testsuite), ":", any_value(j.test_name)).label(COLUMN_TEST_NAME),
-        sum(j.success_val).label(COLUMN_SUCCESS_COUNT),
-        sum(j.flake_count).label(COLUMN_FLAKE_COUNT),
-    ).group_by(
-        j.test_id,
-        j.platform,
-        j.network,
-        j.upgrade,
-        j.arch,
-        j.flat_variants,
-    )
+    pqb = EnvironmentModel.get_environment_query_scan()
 
     def assert_all_set(lt: Iterable, error_msg: str):
         if not all(lt):
@@ -343,9 +320,10 @@ def report(request):
     sample_future = executor.submit(sample_environment_model.read_in_query, sample_query, group_by_param)
     basis_future.result()
     sample_future.result()
+
     sample_environment_model.build_mass_assessment_cache(basis_environment_model, alpha=fisher_alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)
 
-    ordered_environment_names: List[EnvironmentName] = sorted(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names()))
+    ordered_environment_names: List[EnvironmentName] = sorted(set(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names())))
 
     if target_platform_name:
         context['platform'] = target_platform_name
@@ -473,6 +451,7 @@ def report(request):
 
         if not basis_test_record:
             basis_test_record = TestRecord(
+                env_name=sample_test_record.env_name,
                 platform=sample_test_record.platform,
                 network=sample_test_record.network,
                 upgrade=sample_test_record.upgrade,

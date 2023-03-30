@@ -1,10 +1,16 @@
+import time
+
 from sqlalchemy import *
 from sqlalchemy.engine import create_engine
 from sqlalchemy.schema import *
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import expression
 
-from typing import Dict, Optional, Iterable, List, Set
+import pandas
+
+from google.cloud import bigquery, bigquery_storage
+
+from typing import Dict, Optional, Iterable, List, Set, NamedTuple
 from enum import Enum
 
 from .fishers import fisher_significant
@@ -110,8 +116,10 @@ class TestRecord:
     def aggregate_assessment(cls, test_assessments: Iterable[TestRecordAssessment]):
         overall_assessment: TestRecordAssessment = TestRecordAssessment.NOT_SIGNIFICANT
         found_missing_in_sample = False
-        for test_assessment in test_assessments:
+        sorted_test_assessments = sorted(list(test_assessments), key=lambda x: x.val)  # Sort from low score to high
+        for test_assessment in sorted_test_assessments:
             # A single significant regression in any test means an overall regression
+            # This is why the list is sorted ahead of time. Return the worst signal of the group.
             if test_assessment.val < 0:
                 return test_assessment
 
@@ -137,6 +145,7 @@ class TestRecord:
         return TestRecord.aggregate_assessment([test_record.cached_assessment for test_record in test_records])
 
     def __init__(self,
+                 env_name: str,
                  platform: str,
                  network: str,
                  arch: str,
@@ -150,6 +159,7 @@ class TestRecord:
                  total_count_minus_flakes: int = 0,
                  flake_count: int = 0,
                  assessment: TestRecordAssessment = None):
+        self.env_name = env_name
         self.test_id = test_id
         self.testsuite = testsuite
         self.test_name = test_name
@@ -226,6 +236,12 @@ class TestRecord:
 
 
 class TestRecordSet:
+
+    __slots__ = [
+        'test_id',
+        'test_records',
+        'canonical_test_name'
+    ]
 
     def __init__(self, test_id: TestId):
         self.test_id = test_id
@@ -397,6 +413,7 @@ class EnvironmentTestRecords:
             basis_test_record = basis_environment_test_records.all_test_records[test_uuid]
             # TODO: if a test_id has been officially deprecated by staff, do not add this record
             place_holder_record = TestRecord(
+                env_name=basis_test_record.env_name,
                 platform=basis_test_record.platform,
                 network=basis_test_record.network,
                 upgrade=basis_test_record.upgrade,
@@ -419,6 +436,28 @@ class EnvironmentTestRecords:
                 sample_test_record.cached_assessment = TestRecordAssessment.MISSING_IN_BASIS
 
 
+class ModelColumn(NamedTuple):
+    name: str
+    offset: int  # column offset when looking at dataframe
+
+
+# Column offsets must exactly match the order get_environment_query_scan
+COLUMN_NETWORK = ModelColumn('network', 0)
+COLUMN_UPGRADE = ModelColumn('upgrade', 1)
+COLUMN_ARCH = ModelColumn('arch', 2)
+COLUMN_PLATFORM = ModelColumn('platform', 3)
+COLUMN_TEST_ID = ModelColumn('test_id', 4)
+COLUMN_FLAT_VARIANTS = ModelColumn('flat_variants', 5)
+COLUMN_TESTSUITE = ModelColumn('testsuite', 6)
+COLUMN_TOTAL_COUNT = ModelColumn('total_count', 7)
+COLUMN_TEST_NAME = ModelColumn('test_name', 8)
+COLUMN_SUCCESS_COUNT = ModelColumn('success_count', 9)
+COLUMN_FLAKE_COUNT = ModelColumn('flake_count', 10)
+LAST_REAL_COLUMN = COLUMN_FLAKE_COUNT
+COLUMN_COMPUTED_FAILURE_COUNT_OPTION = ModelColumn('failure_count_option', LAST_REAL_COLUMN.offset+1)
+COLUMN_COMPUTED_TOTAL_MINUS_FLAKES_OPTION = ModelColumn('total_minus_flakes_option', LAST_REAL_COLUMN.offset+2)
+
+
 class EnvironmentModel:
 
     def get_ordered_environment_names(self):
@@ -438,7 +477,38 @@ class EnvironmentModel:
         self.environment_test_records: Dict[EnvironmentName, EnvironmentTestRecords] = dict()
         self.all_component_names: Set[ComponentName] = set()
 
+    @classmethod
+    def get_environment_query_scan(cls):
+        j = Junit
+        return select(
+            j.network,
+            j.upgrade,
+            j.arch,
+            j.platform,
+            j.test_id,
+            j.flat_variants,
+            any_value(j.testsuite).label(COLUMN_TESTSUITE.name),
+            count(j.test_id).label(COLUMN_TOTAL_COUNT.name),
+            concat(any_value(j.testsuite), ":", any_value(j.test_name)).label(COLUMN_TEST_NAME.name),
+            sum(j.success_val).label(COLUMN_SUCCESS_COUNT.name),
+            sum(j.flake_count).label(COLUMN_FLAKE_COUNT.name),
+        ).group_by(
+            j.test_id,
+            j.platform,
+            j.network,
+            j.upgrade,
+            j.arch,
+            j.flat_variants,
+        ).where(
+            or_(
+                j.testsuite == 'openshift-tests',
+                j.testsuite == 'openshift-tests-upgrade'
+            )
+        )
+
     def read_in_query(self, query, group_by: str):
+        bq_client = bigquery.Client(project='openshift-gce-devel')
+
         group_by_elements = group_by.split(',')
         group_by_network = 'network' in group_by_elements
         group_by_upgrade = 'upgrade' in group_by_elements
@@ -449,54 +519,154 @@ class EnvironmentModel:
         if not any((group_by_network, group_by_upgrade, group_by_arch, group_by_platform, group_by_variant)):
             raise IOError('Invalid group-by values')
 
-        for row in query.execute():
-            env_attributes: Dict[str, str] = dict()
-            env_name_components: List[str] = list()  # order of this list reflects in column heading names
+        def get_environment_name(data_frame_row):
+            env_name_components: List[str] = list()
             if group_by_platform:
-                env_attributes['platform'] = row.platform
-                env_name_components.append(row.platform)
+                env_name_components.append(data_frame_row[COLUMN_PLATFORM.offset])
             if group_by_arch:
-                env_attributes['arch'] = row.arch
-                env_name_components.append(row.arch)
+                env_name_components.append(data_frame_row[COLUMN_ARCH.offset])
             if group_by_network:
-                env_attributes['network'] = row.network
-                env_name_components.append(row.network)
+                env_name_components.append(data_frame_row[COLUMN_NETWORK.offset])
             if group_by_upgrade:
-                env_attributes['upgrade'] = row.upgrade
-                env_name_components.append(row.upgrade)
+                env_name_components.append(data_frame_row[COLUMN_UPGRADE.offset])
             if group_by_variant:
-                env_attributes['variant'] = row.flat_variants
-                env_name_components.append(row.flat_variants)
+                env_name_components.append(data_frame_row[COLUMN_FLAT_VARIANTS.offset])
 
-            env_name = ' '.join(env_name_components)
-            flake_count = row.flake_count
-            success_count = row.success_count
-            # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
-            # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
-            # failure) is included. This could make total_count - flake_count a negative value.
-            total_count_minus_flakes = max(success_count, row.total_count - flake_count)
+            return ' '.join(env_name_components)
 
-            r = TestRecord(
-                platform=row.platform,
-                network=row.network,
-                upgrade=row.upgrade,
-                flat_variants=row.flat_variants,
-                arch=row.arch,
-                test_id=row.test_id,
-                testsuite=row.testsuite,
-                test_name=row.test_name,
-                success_count=success_count,
-                failure_count=total_count_minus_flakes - success_count,
-                total_count_minus_flakes=total_count_minus_flakes,
-                flake_count=flake_count,
+        raw_query_string = str(query.compile(_junit_table_engine, compile_kwargs={"literal_binds": True}))
+
+        # rows = bq_client.query(raw_query_string)
+        # rows = rows.result()
+        #
+        # time_spent_in_processing = 0.0
+        # for row in rows:
+        #
+        #     if 'x' in [row.arch, row.platform, row.network, row.upgrade, row.flat_variants, row.success_count, row.flake_count, row.test_id, row.test_name, row.testsuite]:
+        #         raise IOError('should be this')
+        #
+        #     start = time.time()
+        #     env_attributes: Dict[str, str] = dict()
+        #     env_name_components: List[str] = list()  # order of this list reflects in column heading names
+        #     if group_by_platform:
+        #         env_attributes['platform'] = row.platform
+        #         env_name_components.append(row.platform)
+        #     if group_by_arch:
+        #         env_attributes['arch'] = row.arch
+        #         env_name_components.append(row.arch)
+        #     if group_by_network:
+        #         env_attributes['network'] = row.network
+        #         env_name_components.append(row.network)
+        #     if group_by_upgrade:
+        #         env_attributes['upgrade'] = row.upgrade
+        #         env_name_components.append(row.upgrade)
+        #     if group_by_variant:
+        #         env_attributes['variant'] = row.flat_variants
+        #         env_name_components.append(row.flat_variants)
+        #
+        #     env_name = ' '.join(env_name_components)
+        #     flake_count = row.flake_count
+        #     success_count = row.success_count
+        #     # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
+        #     # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
+        #     # failure) is included. This could make total_count - flake_count a negative value.
+        #     total_count_minus_flakes = max(success_count, row.total_count - flake_count)
+        #
+        #     r = TestRecord(
+        #         env_name=env_name,
+        #         platform=row.platform,
+        #         network=row.network,
+        #         upgrade=row.upgrade,
+        #         flat_variants=row.flat_variants,
+        #         arch=row.arch,
+        #         test_id=row.test_id,
+        #         testsuite=row.testsuite,
+        #         test_name=row.test_name,
+        #         success_count=success_count,
+        #         failure_count=total_count_minus_flakes - success_count,
+        #         total_count_minus_flakes=total_count_minus_flakes,
+        #         flake_count=flake_count,
+        #     )
+        #
+        #     environment_test_records = self.get_environment_test_records(env_name, group_by_upgrade, reference=r)
+        #     component_name_modified = environment_test_records.add_test_record(r)
+        #     self.all_component_names.update(component_name_modified)
+        #     time_spent_in_processing += time.time() - start
+        #
+        # print(time_spent_in_processing)
+
+        start_overhead = time.time()
+        #df = bq_client.query(raw_query_string).to_dataframe(create_bqstorage_client=False, progress_bar_type='tqdm')
+        df = bq_client.query(raw_query_string).to_dataframe(create_bqstorage_client=True, progress_bar_type='tqdm')
+        # df = pandas.read_gbq(raw_query_string, dialect='standard', use_bqstorage_api=True)
+        # print(df.head())
+        df = df.assign(failure_count_option=df['total_count'] - df['flake_count'] - df['success_count'])
+        df = df.assign(total_minus_flakes_option=df['total_count'] - df['flake_count'])
+
+        test_records: List[TestRecord] = [
+            TestRecord(
+                env_name=get_environment_name(dfr),
+                platform=dfr[COLUMN_PLATFORM.offset],
+                network=dfr[COLUMN_NETWORK.offset],
+                upgrade=dfr[COLUMN_UPGRADE.offset],
+                flat_variants=dfr[COLUMN_FLAT_VARIANTS.offset],
+                arch=dfr[COLUMN_ARCH.offset],
+                test_id=dfr[COLUMN_TEST_ID.offset],
+                testsuite=dfr[COLUMN_TESTSUITE.offset],
+                test_name=dfr[COLUMN_TEST_NAME.offset],
+                success_count=dfr[COLUMN_SUCCESS_COUNT.offset],
+                failure_count=max(0, dfr[COLUMN_COMPUTED_FAILURE_COUNT_OPTION.offset]),
+                total_count_minus_flakes=max(dfr[COLUMN_SUCCESS_COUNT.offset], dfr[COLUMN_COMPUTED_TOTAL_MINUS_FLAKES_OPTION.offset]),
+                flake_count=dfr[COLUMN_FLAKE_COUNT.offset],
             )
+            for dfr in zip(
+                df[COLUMN_NETWORK.name],
+                df[COLUMN_UPGRADE.name],
+                df[COLUMN_ARCH.name],
+                df[COLUMN_PLATFORM.name],
+                df[COLUMN_TEST_ID.name],
+                df[COLUMN_FLAT_VARIANTS.name],
+                df[COLUMN_TESTSUITE.name],
+                df[COLUMN_TOTAL_COUNT.name],
+                df[COLUMN_TEST_NAME.name],
+                df[COLUMN_SUCCESS_COUNT.name],
+                df[COLUMN_FLAKE_COUNT.name],
+                df[COLUMN_COMPUTED_FAILURE_COUNT_OPTION.name],
+                df[COLUMN_COMPUTED_TOTAL_MINUS_FLAKES_OPTION.name]
+            )
+        ]
 
-            environment_test_records = self.get_environment_test_records(env_name, group_by_upgrade, **env_attributes)
+        def get_environment_attribute(test_record: TestRecord):
+            env_attributes: Dict[str, str] = dict()
+            if group_by_platform:
+                env_attributes['platform'] = test_record.platform
+            if group_by_arch:
+                env_attributes['arch'] = test_record.arch
+            if group_by_network:
+                env_attributes['network'] = test_record.network
+            if group_by_upgrade:
+                env_attributes['upgrade'] = test_record.upgrade
+            if group_by_variant:
+                env_attributes['variant'] = test_record.flat_variants
+            return env_attributes
+
+        total_time = 0.0
+        for r in test_records:
+            if 'x' in [r.env_name, r.test_name, r.test_name, r.test_name, r.arch, r.success_count, r.total_count_minus_flakes, r.flat_variants, r.network, r.platform, r.testsuite, r.test_uuid]:
+                raise IOError('nope')
+            start = time.time()
+            if r.env_name in self.environment_test_records:
+                # avoid created environment attributes dict if a record has already been established.
+                environment_test_records = self.get_environment_test_records(r.env_name, group_by_upgrade)
+            else:
+                environment_test_records = self.get_environment_test_records(r.env_name, group_by_upgrade, **get_environment_attribute(r))
             component_name_modified = environment_test_records.add_test_record(r)
             self.all_component_names.update(component_name_modified)
+            total_time += time.time() - start
+        print(f'Tree building time: {total_time}')
+        print(f'Overhead time: {time.time() - start_overhead - total_time}')
 
     def build_mass_assessment_cache(self, basis_model: "EnvironmentModel", alpha: float = 0.05, regression_when_missing: bool = True, pity_factor: float = 0.05):
-
         # Get a list of all environments - including both basis and sample in case
         # there is one in basis that no longer exists in samples.
         all_names = set(self.get_ordered_environment_names())

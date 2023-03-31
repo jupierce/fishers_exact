@@ -137,6 +137,10 @@
                     optional_params += '&missing=regression';
                 }
 
+                if (!$("#ignore-disruption-tests").is(':checked')) {
+                    optional_params += '&disruption=1';
+                }
+
                 var exclude_platforms = ""
                 $(".exclude-platform-checkbox").each(function() {
                     if ($(this).is(':checked')) {
@@ -497,6 +501,11 @@
             <p>Tests missing in Sample</p>
             <label for="ignore-missing-sample">Ignore</label>
             <input type="checkbox" checked="checked" id="ignore-missing-sample"/>
+
+            <p>Disruption Tests</p>
+            <label for="ignore-disruption-tests">Ignore</label>
+            <input type="checkbox" checked="checked" id="ignore-disruption-tests"/>
+
         </div>
     </div>
 

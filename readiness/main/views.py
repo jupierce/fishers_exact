@@ -164,6 +164,9 @@ def report(request):
     missing_samples_param = insufficient_sanitization("missing", "ok")
     regression_when_missing = missing_samples_param != "ok"
 
+    include_disruptions_param = insufficient_sanitization("disruption", "0")
+    include_disruptions = include_disruptions_param == 1
+
     target_component_name = insufficient_sanitization('component', None)
     target_capability_name = insufficient_sanitization('capability', None)
     target_test_id = insufficient_sanitization('test_id', None)
@@ -224,6 +227,11 @@ def report(request):
     if target_platform_name:
         pqb = pqb.filter(
             j.platform == target_platform_name
+        )
+
+    if not include_disruptions:
+        pqb = pqb.filter(
+            j.test_name.notlike('%disruption/%')
         )
 
     if target_test_id:

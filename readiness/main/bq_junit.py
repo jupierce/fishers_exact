@@ -351,9 +351,10 @@ class EnvironmentTestRecords:
 
     COMPONENT_NAME_PATTERN = re.compile(r'\[[^\\]+?\]')
 
-    def __init__(self, name: EnvironmentName, grouping_by_upgrade=False, platform: str = '', arch: str = '', network: str = '', upgrade: str = '', variant: str = ''):
+    def __init__(self, reference: TestRecord, grouping_by_upgrade: bool, platform: str = '', arch: str = '', network: str = '', upgrade: str = '', variant: str = ''):
         self.all_test_record_uuids: Set[TestUUID] = set()
-        self.name: EnvironmentName = name
+        self.name: EnvironmentName = reference.env_name
+        self.reference = reference
         self.grouping_by_upgrade = grouping_by_upgrade
         self.component_test_records: Dict[ComponentName, ComponentTestRecords] = dict()
         self.platform = platform
@@ -453,7 +454,8 @@ COLUMN_TOTAL_COUNT = ModelColumn('total_count', 7)
 COLUMN_TEST_NAME = ModelColumn('test_name', 8)
 COLUMN_SUCCESS_COUNT = ModelColumn('success_count', 9)
 COLUMN_FLAKE_COUNT = ModelColumn('flake_count', 10)
-LAST_REAL_COLUMN = COLUMN_FLAKE_COUNT
+COLUMN_ENV_NAME = ModelColumn('env_name', 11)
+LAST_REAL_COLUMN = COLUMN_ENV_NAME
 COLUMN_COMPUTED_FAILURE_COUNT_OPTION = ModelColumn('failure_count_option', LAST_REAL_COLUMN.offset+1)
 COLUMN_COMPUTED_TOTAL_MINUS_FLAKES_OPTION = ModelColumn('total_minus_flakes_option', LAST_REAL_COLUMN.offset+2)
 
@@ -466,21 +468,56 @@ class EnvironmentModel:
     def get_ordered_component_names(self):
         return sorted(self.all_component_names)
 
-    def get_environment_test_records(self, env_name, grouping_by_upgrades=False, **kwargs) -> EnvironmentTestRecords:
+    def get_environment_test_records(self, env_name: str, reference: TestRecord = None) -> EnvironmentTestRecords:
         if env_name in self.environment_test_records:
             return self.environment_test_records[env_name]
-        new_etr = EnvironmentTestRecords(env_name, grouping_by_upgrades, **kwargs)
+        new_etr = EnvironmentTestRecords(reference, self.group_by_upgrade,
+                                         platform=reference.platform if self.group_by_platform else '',
+                                         arch=reference.arch if self.group_by_arch else '',
+                                         network=reference.network if self.group_by_network else '',
+                                         upgrade=reference.upgrade if self.group_by_upgrade else '',
+                                         variant=reference.variant if self.group_by_variant else '',
+                                         )
         self.environment_test_records[env_name] = new_etr
         return new_etr
 
-    def __init__(self):
+    def __init__(self, name, group_by):
         self.environment_test_records: Dict[EnvironmentName, EnvironmentTestRecords] = dict()
         self.all_component_names: Set[ComponentName] = set()
+        self.model_name = name
+        self.group_by = group_by
 
-    @classmethod
-    def get_environment_query_scan(cls):
+        group_by_elements = self.group_by.split(',')
+        self.group_by_network = 'network' in group_by_elements
+        self.group_by_upgrade = 'upgrade' in group_by_elements
+        self.group_by_arch = 'arch' in group_by_elements
+        self.group_by_variant = 'variant' in group_by_elements
+        self.group_by_platform = 'cloud' in group_by_elements or 'platform' in group_by_elements
+
+        if not any((self.group_by_network, self.group_by_upgrade, self.group_by_arch, self.group_by_platform, self.group_by_variant)):
+            raise IOError('Invalid group-by values')
+
+    def get_environment_query_scan(self):
         j = Junit
-        return select(
+        env_name_components = []
+
+        def append_env_component(col):
+            if env_name_components:
+                env_name_components.append(' ')
+            env_name_components.append(col)
+
+        if self.group_by_platform:
+            append_env_component(j.platform)
+        if self.group_by_arch:
+            append_env_component(j.arch)
+        if self.group_by_network:
+            append_env_component(j.network)
+        if self.group_by_upgrade:
+            append_env_component(j.upgrade)
+        if self.group_by_variant:
+            append_env_component(j.offset)
+
+        base_select = select(
             j.network,
             j.upgrade,
             j.arch,
@@ -492,7 +529,10 @@ class EnvironmentModel:
             concat(any_value(j.testsuite), ":", any_value(j.test_name)).label(COLUMN_TEST_NAME.name),
             sum(j.success_val).label(COLUMN_SUCCESS_COUNT.name),
             sum(j.flake_count).label(COLUMN_FLAKE_COUNT.name),
-        ).group_by(
+            concat(*env_name_components).label(COLUMN_ENV_NAME.name)
+        )
+
+        return base_select.group_by(
             j.test_id,
             j.platform,
             j.network,
@@ -506,33 +546,8 @@ class EnvironmentModel:
             )
         )
 
-    def read_in_query(self, query, group_by: str):
+    def read_in_query(self, query):
         bq_client = bigquery.Client(project='openshift-gce-devel')
-
-        group_by_elements = group_by.split(',')
-        group_by_network = 'network' in group_by_elements
-        group_by_upgrade = 'upgrade' in group_by_elements
-        group_by_arch = 'arch' in group_by_elements
-        group_by_variant = 'variant' in group_by_elements
-        group_by_platform = 'cloud' in group_by_elements or 'platform' in group_by_elements
-
-        if not any((group_by_network, group_by_upgrade, group_by_arch, group_by_platform, group_by_variant)):
-            raise IOError('Invalid group-by values')
-
-        def get_environment_name(data_frame_row):
-            env_name_components: List[str] = list()
-            if group_by_platform:
-                env_name_components.append(data_frame_row[COLUMN_PLATFORM.offset])
-            if group_by_arch:
-                env_name_components.append(data_frame_row[COLUMN_ARCH.offset])
-            if group_by_network:
-                env_name_components.append(data_frame_row[COLUMN_NETWORK.offset])
-            if group_by_upgrade:
-                env_name_components.append(data_frame_row[COLUMN_UPGRADE.offset])
-            if group_by_variant:
-                env_name_components.append(data_frame_row[COLUMN_FLAT_VARIANTS.offset])
-
-            return ' '.join(env_name_components)
 
         raw_query_string = str(query.compile(_junit_table_engine, compile_kwargs={"literal_binds": True}))
 
@@ -605,7 +620,7 @@ class EnvironmentModel:
 
         test_records: List[TestRecord] = [
             TestRecord(
-                env_name=get_environment_name(dfr),
+                env_name=dfr[COLUMN_ENV_NAME.offset],
                 platform=dfr[COLUMN_PLATFORM.offset],
                 network=dfr[COLUMN_NETWORK.offset],
                 upgrade=dfr[COLUMN_UPGRADE.offset],
@@ -631,35 +646,16 @@ class EnvironmentModel:
                 df[COLUMN_TEST_NAME.name],
                 df[COLUMN_SUCCESS_COUNT.name],
                 df[COLUMN_FLAKE_COUNT.name],
+                df[COLUMN_ENV_NAME.name],
                 df[COLUMN_COMPUTED_FAILURE_COUNT_OPTION.name],
-                df[COLUMN_COMPUTED_TOTAL_MINUS_FLAKES_OPTION.name]
+                df[COLUMN_COMPUTED_TOTAL_MINUS_FLAKES_OPTION.name],
             )
         ]
 
-        def get_environment_attribute(test_record: TestRecord):
-            env_attributes: Dict[str, str] = dict()
-            if group_by_platform:
-                env_attributes['platform'] = test_record.platform
-            if group_by_arch:
-                env_attributes['arch'] = test_record.arch
-            if group_by_network:
-                env_attributes['network'] = test_record.network
-            if group_by_upgrade:
-                env_attributes['upgrade'] = test_record.upgrade
-            if group_by_variant:
-                env_attributes['variant'] = test_record.flat_variants
-            return env_attributes
-
         total_time = 0.0
         for r in test_records:
-            if 'x' in [r.env_name, r.test_name, r.test_name, r.test_name, r.arch, r.success_count, r.total_count_minus_flakes, r.flat_variants, r.network, r.platform, r.testsuite, r.test_uuid]:
-                raise IOError('nope')
             start = time.time()
-            if r.env_name in self.environment_test_records:
-                # avoid created environment attributes dict if a record has already been established.
-                environment_test_records = self.get_environment_test_records(r.env_name, group_by_upgrade)
-            else:
-                environment_test_records = self.get_environment_test_records(r.env_name, group_by_upgrade, **get_environment_attribute(r))
+            environment_test_records = self.get_environment_test_records(r.env_name, reference=r)
             component_name_modified = environment_test_records.add_test_record(r)
             self.all_component_names.update(component_name_modified)
             total_time += time.time() - start
@@ -672,7 +668,10 @@ class EnvironmentModel:
         all_names = set(self.get_ordered_environment_names())
         all_names.update(basis_model.get_ordered_environment_names())
 
-        for environment_name in all_names:
-            sample_environment_test_records = self.get_environment_test_records(environment_name)
-            basis_environment_test_records = basis_model.get_environment_test_records(environment_name)
-            sample_environment_test_records.build_mass_assessment_cache(basis_environment_test_records, alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)
+        # Make sure all basis environments / components / capabilities exist in the sample environment
+        for environment_name, env in basis_model.environment_test_records.items():
+            self.get_environment_test_records(environment_name, env.reference)
+
+        for environment_name, env in self.environment_test_records.items():
+            basis_model.get_environment_test_records(environment_name, env.reference)   # Make sure the sample environments / components / capabilities exist in basis
+            env.build_mass_assessment_cache(basis_model.environment_test_records[environment_name], alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)

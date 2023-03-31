@@ -184,7 +184,9 @@ def report(request):
     exclude_variants_param = insufficient_sanitization('exclude_variants', None)
 
     j = Junit
-    pqb = EnvironmentModel.get_environment_query_scan()
+    basis_environment_model = EnvironmentModel('basis', group_by_param)
+    sample_environment_model = EnvironmentModel('sample', group_by_param)
+    pqb = basis_environment_model.get_environment_query_scan()
 
     def assert_all_set(lt: Iterable, error_msg: str):
         if not all(lt):
@@ -314,10 +316,8 @@ def report(request):
     # waiting for bigquery).
 
     executor = ThreadPoolExecutor(2)
-    basis_environment_model = EnvironmentModel()
-    sample_environment_model = EnvironmentModel()
-    basis_future = executor.submit(basis_environment_model.read_in_query, basis_query, group_by_param)
-    sample_future = executor.submit(sample_environment_model.read_in_query, sample_query, group_by_param)
+    basis_future = executor.submit(basis_environment_model.read_in_query, basis_query)
+    sample_future = executor.submit(sample_environment_model.read_in_query, sample_query)
     basis_future.result()
     sample_future.result()
 

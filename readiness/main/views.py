@@ -4,13 +4,13 @@ from concurrent.futures import ThreadPoolExecutor
 
 from multiprocessing import Process
 
-from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable, Set
+from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable, Set, Union
 
 from django.utils.html import format_html
 from django.http import HttpResponse
 import django_tables2 as tables
 
-from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId, concat, array_to_string, _junit_table_engine
+from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId, AggregateTestAssessment
 from .fishers import fisher_significant
 
 import fast_fisher.fast_fisher_cython
@@ -36,10 +36,17 @@ class ImageColumnLink(NamedTuple):
 
 
 class AssessmentImageColumnLink:
-    def __init__(self, assessment: TestRecordAssessment, href: str = '/main/report', href_params: Dict[str, str] = None):
+    def __init__(self, assessment: Union[TestRecordAssessment, AggregateTestAssessment], href: str = '/main/report', href_params: Dict[str, str] = None):
         self.image_path = f'main/{assessment.image_path}'
         self.height = 16
         self.width = 16
+        if assessment.val < 0 and isinstance(assessment, AggregateTestAssessment):
+            if assessment.count == 1:
+                self.width = 8
+                self.height = 8
+            elif assessment.count < 4:
+                self.width = 11
+                self.height = 11
         self.href = href
         self.href_params = href_params
         self.title = assessment.description
@@ -353,6 +360,9 @@ def report(request):
     if missing_samples_param != "ok":
         context['missing'] = missing_samples_param
 
+    if include_disruptions:
+        context['disruption'] = include_disruptions_param
+
     def populate_environment_link_context(environment_test_records: EnvironmentTestRecords, link_context: Dict):
         if environment_test_records.platform:
             link_context['platform'] = environment_test_records.platform
@@ -604,7 +614,7 @@ def report(request):
                 sample_environment_test_records: EnvironmentTestRecords = sample_environment_model.get_environment_test_records(environment_name)
                 sample_component_test_records = sample_environment_test_records.get_component_test_records(component_name)
 
-                component_assessment: TestRecordAssessment = sample_component_test_records.assessment()
+                component_assessment: AggregateTestAssessment = sample_component_test_records.assessment()
 
                 href_params = dict(context)
                 href_params['component'] = component_name

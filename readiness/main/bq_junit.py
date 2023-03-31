@@ -8,7 +8,7 @@ from sqlalchemy.sql import expression
 
 from google.cloud import bigquery, bigquery_storage
 
-from typing import Dict, Optional, Iterable, List, Set, NamedTuple
+from typing import Dict, Optional, Iterable, List, Set, NamedTuple, Union
 from enum import Enum
 
 from .fishers import fisher_significant
@@ -108,18 +108,18 @@ class TestRecordAssessment(Enum):
         self.image_path = image_path
 
 
-class TestRecord:
-
-    @classmethod
-    def aggregate_assessment(cls, test_assessments: Iterable[TestRecordAssessment]):
+class AggregateTestAssessment:
+    def __init__(self, test_assessments: Union[Iterable[TestRecordAssessment], Iterable["AggregateTestAssessment"]]):
         overall_assessment: TestRecordAssessment = TestRecordAssessment.NOT_SIGNIFICANT
         found_missing_in_sample = False
-        sorted_test_assessments = sorted(list(test_assessments), key=lambda x: x.val)  # Sort from low score to high
-        for test_assessment in sorted_test_assessments:
-            # A single significant regression in any test means an overall regression
-            # This is why the list is sorted ahead of time. Return the worst signal of the group.
+        self.count = 0
+        for test_assessment in test_assessments:
+
             if test_assessment.val < 0:
-                return test_assessment
+                self.count += 1
+                if overall_assessment.val > test_assessment.val:
+                    overall_assessment = test_assessment
+                continue
 
             if test_assessment is TestRecordAssessment.MISSING_IN_SAMPLE:
                 # Prefer to return something more interesting like SIGNIFICANT_REGRESSION,
@@ -134,13 +134,18 @@ class TestRecord:
                 overall_assessment = test_assessment
 
         if found_missing_in_sample:
-            return TestRecordAssessment.MISSING_IN_SAMPLE
+            overall_assessment = TestRecordAssessment.MISSING_IN_SAMPLE
 
-        return overall_assessment
+        self.description = overall_assessment.description
+        self.val = overall_assessment.val
+        self.image_path = overall_assessment.image_path
+
+
+class TestRecord:
 
     @classmethod
-    def aggregate_test_record_assessment(cls, test_records: Iterable["TestRecord"]) -> TestRecordAssessment:
-        return TestRecord.aggregate_assessment([test_record.cached_assessment for test_record in test_records])
+    def aggregate_test_record_assessment(cls, assessments: Union[Iterable["TestRecordAssessment"], Iterable[AggregateTestAssessment]]) -> AggregateTestAssessment:
+        return AggregateTestAssessment([assessment for assessment in assessments])
 
     def __init__(self,
                  env_name: str,
@@ -265,8 +270,8 @@ class TestRecordSet:
             # TODO: for now, just pick the first name we find and treat it as the canonical name.
             self.canonical_test_name = test_record.test_name
 
-    def assessment(self) -> TestRecordAssessment:
-        return TestRecord.aggregate_test_record_assessment(self.test_records.values())
+    def assessment(self) -> AggregateTestAssessment:
+        return TestRecord.aggregate_test_record_assessment([tr.assessment() for tr in self.test_records.values()])
 
     def get_test_name(self) -> str:
         # Over time, test names may change between releases. Return the canonical
@@ -296,8 +301,8 @@ class CapabilityTestRecords:
     def add_test_record(self, test_record: TestRecord):
         self.get_test_record_set(test_record.test_id).add_test_record(test_record)
 
-    def assessment(self) -> TestRecordAssessment:
-        return TestRecord.aggregate_assessment([ctr.assessment() for ctr in self.test_record_sets.values()])
+    def assessment(self) -> AggregateTestAssessment:
+        return TestRecord.aggregate_test_record_assessment([ctr.assessment() for ctr in self.test_record_sets.values()])
 
 
 class ComponentTestRecords:
@@ -343,8 +348,8 @@ class ComponentTestRecords:
         for capability_name in self.find_associated_capabilities(test_record):
             self.get_capability_test_records(capability_name).add_test_record(test_record)
 
-    def assessment(self) -> TestRecordAssessment:
-        return TestRecord.aggregate_assessment([ctr.assessment() for ctr in self.capability_test_records.values()])
+    def assessment(self) -> AggregateTestAssessment:
+        return TestRecord.aggregate_test_record_assessment([ctr.assessment() for ctr in self.capability_test_records.values()])
 
 
 class EnvironmentTestRecords:
@@ -401,8 +406,8 @@ class EnvironmentTestRecords:
     def get_component_names(self):
         return self.component_test_records.keys()
 
-    def assessment(self) -> TestRecordAssessment:
-        return TestRecord.aggregate_assessment([ctr.assessment() for ctr in self.component_test_records.values()])
+    def assessment(self) -> AggregateTestAssessment:
+        return TestRecord.aggregate_test_record_assessment([ctr.assessment() for ctr in self.component_test_records.values()])
 
     def build_mass_assessment_cache(self, basis_environment_test_records: "EnvironmentTestRecords", alpha: float, regression_when_missing: bool, pity_factor: float = 0.05):
 

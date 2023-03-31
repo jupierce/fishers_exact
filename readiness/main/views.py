@@ -357,7 +357,7 @@ def report(request):
         if environment_test_records.variant:
             link_context['variant'] = environment_test_records.variant
 
-    if target_test_id:  # Rendering a specifically requested TestRecordSet test_id
+    if target_test_id and not target_test_uuid:  # Rendering a specifically requested TestRecordSet test_id
         if not target_environment_name:
             return HttpResponse(f'No environment parameter was specified')
         if not target_component_name:

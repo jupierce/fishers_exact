@@ -6,8 +6,6 @@ from sqlalchemy.schema import *
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.sql import expression
 
-import pandas
-
 from google.cloud import bigquery, bigquery_storage
 
 from typing import Dict, Optional, Iterable, List, Set, NamedTuple
@@ -168,18 +166,22 @@ class TestRecord:
         self.total_count_minus_flakes = total_count_minus_flakes
         self.flake_count = flake_count
         self.cached_assessment = assessment
-        self.success_rate = '{:.2f}'.format(0.0 if total_count_minus_flakes == 0 else 100 * success_count / total_count_minus_flakes)
         self.platform = platform
         self.network = network
         self.arch = arch
         self.upgrade = upgrade
         self.flat_variants = flat_variants
-        self.test_uuid: TestUUID = f'p={platform};n={network};a={arch};u={upgrade};v={flat_variants};id={test_id}'
+        self.pass_percentage = 0.0 if self.total_count_minus_flakes == 0 else 100 * self.success_count / self.total_count_minus_flakes
+        self.test_uuid: TestUUID = ':'.join((platform, network, arch, upgrade, flat_variants, test_id))
 
     def assessment(self) -> TestRecordAssessment:
         if self.cached_assessment is None:
             return TestRecordAssessment.MISSING_IN_BASIS
         return self.cached_assessment
+
+    @property
+    def success_rate_str(self) -> str:
+        return '{:.2f}'.format(self.pass_percentage)
 
     def compute_assessment(self, basis_test_record: "TestRecord", alpha: float, regression_when_missing: bool, pity_factor: float = 0.05):
         if self.cached_assessment:
@@ -195,8 +197,8 @@ class TestRecord:
                 else:
                     return TestRecordAssessment.NOT_SIGNIFICANT
 
-            basis_pass_percentage = basis_test_record.success_count / basis_test_record.total_count_minus_flakes
-            sample_pass_percentage = self.success_count / self.total_count_minus_flakes
+            basis_pass_percentage = basis_test_record.pass_percentage
+            sample_pass_percentage = self.pass_percentage
             improved = sample_pass_percentage >= basis_pass_percentage
 
             if improved:
@@ -258,9 +260,7 @@ class TestRecordSet:
         return list(self.test_records.values())
 
     def add_test_record(self, test_record: TestRecord):
-        if test_record.test_uuid in self.test_records:
-            return
-        self.test_records[test_record.test_uuid] = test_record
+        self.test_records.setdefault(test_record.test_uuid, test_record)
         if not self.canonical_test_name:
             # TODO: for now, just pick the first name we find and treat it as the canonical name.
             self.canonical_test_name = test_record.test_name
@@ -284,11 +284,11 @@ class CapabilityTestRecords:
         return list(self.test_record_sets.keys())
 
     def get_test_record_set(self, test_id: TestId):
-        if test_id in self.test_record_sets:
-            return self.test_record_sets[test_id]
-        ntrs = TestRecordSet(test_id)
-        self.test_record_sets[test_id] = ntrs
-        return ntrs
+        trs = self.test_record_sets.get(test_id, None)
+        if not trs:
+            trs = TestRecordSet(test_id)
+            self.test_record_sets[test_id] = trs
+        return trs
 
     def get_test_record_sets(self):
         return self.test_record_sets.values()
@@ -311,11 +311,11 @@ class ComponentTestRecords:
         return list(self.capability_test_records.keys())
 
     def get_capability_test_records(self, capability_name: CapabilityName) -> CapabilityTestRecords:
-        if capability_name in self.capability_test_records:
-            return self.capability_test_records[capability_name]
-        new_ctr = CapabilityTestRecords(capability_name)
-        self.capability_test_records[capability_name] = new_ctr
-        return new_ctr
+        ctr = self.capability_test_records.get(capability_name, None)
+        if not ctr:
+            ctr = CapabilityTestRecords(capability_name)
+            self.capability_test_records[capability_name] = ctr
+        return ctr
 
     def find_associated_capabilities(self, test_record: TestRecord) -> Iterable[CapabilityName]:
         associated_capabilities: List[CapabilityName] = list()
@@ -378,11 +378,11 @@ class EnvironmentTestRecords:
         return f"[cloud='{self.platform}' arch='{self.arch}' network='{self.network}' upgrade='{self.upgrade}' variant='{self.variant}']"
 
     def get_component_test_records(self, component_name: ComponentName) -> ComponentTestRecords:
-        if component_name in self.component_test_records:
-            return self.component_test_records[component_name]
-        new_ctr = ComponentTestRecords(component_name, self.grouping_by_upgrade)
-        self.component_test_records[component_name] = new_ctr
-        return new_ctr
+        ctr = self.component_test_records.get(component_name, None)
+        if not ctr:
+            ctr = ComponentTestRecords(component_name, self.grouping_by_upgrade)
+            self.component_test_records[component_name] = ctr
+        return ctr
 
     def find_associated_components(self, test_record: TestRecord) -> Iterable[ComponentName]:
         return re.findall(EnvironmentTestRecords.COMPONENT_NAME_PATTERN, test_record.test_name)
@@ -430,8 +430,8 @@ class EnvironmentTestRecords:
             self.add_test_record(place_holder_record)
 
         for test_uuid, sample_test_record in self.all_test_records.items():
-            if test_uuid in basis_environment_test_records.all_test_records:
-                basis_test_record = basis_environment_test_records.all_test_records[test_uuid]
+            basis_test_record = basis_environment_test_records.all_test_records.get(test_uuid, None)
+            if basis_test_record:
                 sample_test_record.compute_assessment(basis_test_record, alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)
             else:
                 sample_test_record.cached_assessment = TestRecordAssessment.MISSING_IN_BASIS
@@ -469,17 +469,17 @@ class EnvironmentModel:
         return sorted(self.all_component_names)
 
     def get_environment_test_records(self, env_name: str, reference: TestRecord = None) -> EnvironmentTestRecords:
-        if env_name in self.environment_test_records:
-            return self.environment_test_records[env_name]
-        new_etr = EnvironmentTestRecords(reference, self.group_by_upgrade,
+        etr = self.environment_test_records.get(env_name, None)
+        if not etr:
+            etr = EnvironmentTestRecords(reference, self.group_by_upgrade,
                                          platform=reference.platform if self.group_by_platform else '',
                                          arch=reference.arch if self.group_by_arch else '',
                                          network=reference.network if self.group_by_network else '',
                                          upgrade=reference.upgrade if self.group_by_upgrade else '',
                                          variant=reference.variant if self.group_by_variant else '',
                                          )
-        self.environment_test_records[env_name] = new_etr
-        return new_etr
+            self.environment_test_records[env_name] = etr
+        return etr
 
     def __init__(self, name, group_by):
         self.environment_test_records: Dict[EnvironmentName, EnvironmentTestRecords] = dict()
@@ -548,67 +548,7 @@ class EnvironmentModel:
 
     def read_in_query(self, query):
         bq_client = bigquery.Client(project='openshift-gce-devel')
-
         raw_query_string = str(query.compile(_junit_table_engine, compile_kwargs={"literal_binds": True}))
-
-        # rows = bq_client.query(raw_query_string)
-        # rows = rows.result()
-        #
-        # time_spent_in_processing = 0.0
-        # for row in rows:
-        #
-        #     if 'x' in [row.arch, row.platform, row.network, row.upgrade, row.flat_variants, row.success_count, row.flake_count, row.test_id, row.test_name, row.testsuite]:
-        #         raise IOError('should be this')
-        #
-        #     start = time.time()
-        #     env_attributes: Dict[str, str] = dict()
-        #     env_name_components: List[str] = list()  # order of this list reflects in column heading names
-        #     if group_by_platform:
-        #         env_attributes['platform'] = row.platform
-        #         env_name_components.append(row.platform)
-        #     if group_by_arch:
-        #         env_attributes['arch'] = row.arch
-        #         env_name_components.append(row.arch)
-        #     if group_by_network:
-        #         env_attributes['network'] = row.network
-        #         env_name_components.append(row.network)
-        #     if group_by_upgrade:
-        #         env_attributes['upgrade'] = row.upgrade
-        #         env_name_components.append(row.upgrade)
-        #     if group_by_variant:
-        #         env_attributes['variant'] = row.flat_variants
-        #         env_name_components.append(row.flat_variants)
-        #
-        #     env_name = ' '.join(env_name_components)
-        #     flake_count = row.flake_count
-        #     success_count = row.success_count
-        #     # In rare circumstances, based on the date range selected, it is possible for a failed test run to not be included
-        #     # in the query while the success run (including a flake_count=1 reflecting the preceding, but un-selected
-        #     # failure) is included. This could make total_count - flake_count a negative value.
-        #     total_count_minus_flakes = max(success_count, row.total_count - flake_count)
-        #
-        #     r = TestRecord(
-        #         env_name=env_name,
-        #         platform=row.platform,
-        #         network=row.network,
-        #         upgrade=row.upgrade,
-        #         flat_variants=row.flat_variants,
-        #         arch=row.arch,
-        #         test_id=row.test_id,
-        #         testsuite=row.testsuite,
-        #         test_name=row.test_name,
-        #         success_count=success_count,
-        #         failure_count=total_count_minus_flakes - success_count,
-        #         total_count_minus_flakes=total_count_minus_flakes,
-        #         flake_count=flake_count,
-        #     )
-        #
-        #     environment_test_records = self.get_environment_test_records(env_name, group_by_upgrade, reference=r)
-        #     component_name_modified = environment_test_records.add_test_record(r)
-        #     self.all_component_names.update(component_name_modified)
-        #     time_spent_in_processing += time.time() - start
-        #
-        # print(time_spent_in_processing)
 
         start_overhead = time.time()
         #df = bq_client.query(raw_query_string).to_dataframe(create_bqstorage_client=False, progress_bar_type='tqdm')

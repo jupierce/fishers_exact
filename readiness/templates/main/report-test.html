@@ -52,7 +52,7 @@ Test Name: {{sample_test.test_name}}
 <br>
 Sample Release {{sample_release}}<br>
 <ul>
-        <li>Success Rate: {{sample_test.success_rate}}%</li>
+        <li>Success Rate: {{sample_test.success_rate_str}}%</li>
         <li>Successes: {{sample_test.success_count}}</li>
         <li>Failures: {{sample_test.failure_count}}</li>
         <li>Flakes: {{sample_test.flake_count}} (ignored test runs)</li>
@@ -61,7 +61,7 @@ Sample Release {{sample_release}}<br>
 <br> <br>
 Basis Release {{basis_release}} <br>
 <ul>
-        <li>Success Rate: {{basis_test.success_rate}}%</li>
+        <li>Success Rate: {{basis_test.success_rate_str}}%</li>
         <li>Successes: {{basis_test.success_count}}</li>
         <li>Failures: {{basis_test.failure_count}}</li>
         <li>Flakes: {{basis_test.flake_count}} (ignored test runs)</li>

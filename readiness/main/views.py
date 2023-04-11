@@ -1,16 +1,21 @@
+import multiprocessing
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 
-from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable, Set
+from multiprocessing import Process
+
+from typing import Dict, NamedTuple, List, Tuple, Any, Optional, Iterable, Set, Union
 
 from django.utils.html import format_html
 from django.http import HttpResponse
 import django_tables2 as tables
 
-from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId
+from .bq_junit import Junit, select, sum, count, any_value, EnvironmentModel, EnvironmentTestRecords, EnvironmentName, TestRecordAssessment, ComponentTestRecords, TestName, TestRecord, TestId, AggregateTestAssessment
 from .fishers import fisher_significant
 
 import fast_fisher.fast_fisher_cython
 
+from sqlalchemy import text
 
 from django.shortcuts import render
 
@@ -31,10 +36,17 @@ class ImageColumnLink(NamedTuple):
 
 
 class AssessmentImageColumnLink:
-    def __init__(self, assessment: TestRecordAssessment, href: str = '/main/report', href_params: Dict[str, str] = None):
+    def __init__(self, assessment: Union[TestRecordAssessment, AggregateTestAssessment], href: str = '/main/report', href_params: Dict[str, str] = None):
         self.image_path = f'main/{assessment.image_path}'
         self.height = 16
         self.width = 16
+        if assessment.val < 0 and isinstance(assessment, AggregateTestAssessment):
+            if assessment.count == 1:
+                self.width = 8
+                self.height = 8
+            elif assessment.count < 4:
+                self.width = 11
+                self.height = 11
         self.href = href
         self.href_params = href_params
         self.title = assessment.description
@@ -83,10 +95,13 @@ def _render_prowjob_rows(rows) -> str:
         failure_iterations = max(0, row['total_count'] - row['flake_count'] - row['success_count'])
         flake_iterations = row['flake_count']
         success_iterations = max(0, row['success_count'] - row['flake_count'])
+        artifacts_split = row["file_path"].split('/artifacts/', 1)
+        spyglass_path = 'https://prow.ci.openshift.org/view/gs/origin-ci-test/' + artifacts_split[0]
+        junit_file_path = '' if len(artifacts_split) == 1 else artifacts_split[1]
 
         char_entries: List[str] = (['S'] * success_iterations) + (['s'] * flake_iterations) + (['F'] * failure_iterations)
         for outcome_char in char_entries:
-            result += f'<a class="outcome_{outcome_char}" href="https://gcsweb-ci.apps.ci.l2s4.p1.openshiftapps.com/gcs/origin-ci-test/{row["file_path"]}">{outcome_char}</a> '
+            result += f'<a class="outcome_{outcome_char}" href="{spyglass_path}/" title="{junit_file_path}" alt="{junit_file_path}">{outcome_char}</a> '
             char_count += 1
             if char_count % 20 == 0:
                 result += '<br>'
@@ -131,12 +146,6 @@ class AllComponentsTable(tables.Table):
             return value
 
 
-COLUMN_TEST_NAME = 'test_name'
-COLUMN_TOTAL_COUNT = 'total_count'
-COLUMN_SUCCESS_COUNT = 'success_count'
-COLUMN_FLAKE_COUNT = 'flake_count'
-
-
 def report(request):
 
     def insufficient_sanitization(parameter_name: str, parameter_default: Optional[str] = None) -> Optional[str]:
@@ -156,8 +165,14 @@ def report(request):
     confidence_param = insufficient_sanitization("confidence", "95")
     fisher_alpha: float = (100 - int(confidence_param)) / 100
 
+    pity_param = insufficient_sanitization("pity", "5")
+    pity_factor: float = int(pity_param) / 100
+
     missing_samples_param = insufficient_sanitization("missing", "ok")
     regression_when_missing = missing_samples_param != "ok"
+
+    include_disruptions_param = insufficient_sanitization("disruption", "0")
+    include_disruptions = include_disruptions_param == 1
 
     target_component_name = insufficient_sanitization('component', None)
     target_capability_name = insufficient_sanitization('capability', None)
@@ -166,6 +181,7 @@ def report(request):
     target_platform_name = insufficient_sanitization('platform', None)
     target_upgrade_name = insufficient_sanitization('upgrade', None)
     target_arch_name = insufficient_sanitization('arch', None)
+    target_variant_name = insufficient_sanitization('variant', None)
     target_network_name = insufficient_sanitization('network', None)
     target_environment_name = insufficient_sanitization('environment', None)
 
@@ -175,25 +191,12 @@ def report(request):
     exclude_arches_param = insufficient_sanitization('exclude_arches', None)
     exclude_networks_param = insufficient_sanitization('exclude_networks', None)
     exclude_upgrades_param = insufficient_sanitization('exclude_upgrades', None)
+    exclude_variants_param = insufficient_sanitization('exclude_variants', None)
 
     j = Junit
-    pqb = select(
-        j.network,
-        j.upgrade,
-        j.arch,
-        j.platform,
-        j.test_id,
-        any_value(j.test_name).label(COLUMN_TEST_NAME),
-        count(j.test_id).label(COLUMN_TOTAL_COUNT),
-        sum(j.success_val).label(COLUMN_SUCCESS_COUNT),
-        sum(j.flake_count).label(COLUMN_FLAKE_COUNT),
-    ).group_by(
-        j.network,
-        j.upgrade,
-        j.arch,
-        j.platform,
-        j.test_id,
-    )
+    basis_environment_model = EnvironmentModel('basis', group_by_param)
+    sample_environment_model = EnvironmentModel('sample', group_by_param)
+    pqb = basis_environment_model.get_environment_query_scan()
 
     def assert_all_set(lt: Iterable, error_msg: str):
         if not all(lt):
@@ -202,6 +205,16 @@ def report(request):
     assert_all_set((basis_start_dt, basis_end_dt, basis_release), 'At least one basis coordinate has not been specified')
 
     assert_all_set((sample_start_dt, sample_end_dt, sample_release), 'At least one sample coordinate has not been specified')
+
+    context = {
+        'basis_release': basis_release,
+        'basis_start_dt': basis_start_dt,
+        'basis_end_dt': basis_end_dt,
+        'sample_release': sample_release,
+        'sample_start_dt': sample_start_dt,
+        'sample_end_dt': sample_end_dt,
+        'group_by': group_by_param,
+    }
 
     if target_upgrade_name:
         pqb = pqb.filter(
@@ -223,20 +236,27 @@ def report(request):
             j.platform == target_platform_name
         )
 
+    if not include_disruptions:
+        pqb = pqb.filter(
+            j.test_name.notlike('%disruption/%')
+        )
+
     if target_test_id:
         pqb = pqb.filter(
             j.test_id == target_test_id
         )
 
     if exclude_platforms_param:
-        for exclude_prefix in exclude_platforms_param.split(','):
-            if not exclude_prefix:
+        context['exclude_platforms'] = exclude_platforms_param
+        for exclude_element in exclude_platforms_param.split(','):
+            if not exclude_element:
                 continue
             pqb = pqb.filter(
-                j.platform.notlike(f'{exclude_prefix}%')
+                j.platform.notlike(f'{exclude_element}%')
             )
 
     if exclude_arches_param:
+        context['exclude_arches'] = exclude_arches_param
         for exclude_name in exclude_arches_param.split(','):
             if not exclude_name:
                 continue
@@ -245,6 +265,7 @@ def report(request):
             )
 
     if exclude_networks_param:
+        context['exclude_networks'] = exclude_networks_param
         for exclude_name in exclude_networks_param.split(','):
             if not exclude_name:
                 continue
@@ -253,8 +274,9 @@ def report(request):
             )
 
     if exclude_upgrades_param:
+        context['exclude_upgrades'] = exclude_upgrades_param
         upgrade_name_db_mapping = {
-            'install': '',
+            'install': 'none',
             'minor': 'upgrade-minor',
             'micro': 'upgrade-micro',
         }
@@ -263,6 +285,15 @@ def report(request):
                 continue
             pqb = pqb.filter(
                 j.upgrade != upgrade_name_db_mapping[exclude_name]
+            )
+
+    if exclude_variants_param:
+        context['exclude_variants'] = exclude_variants_param
+        for exclude_element in exclude_variants_param.split(','):
+            if not exclude_element:
+                continue
+            pqb = pqb.filter(
+                j.flat_variants.notlike(f'%{exclude_element}%')
             )
 
     # q = f'''
@@ -300,25 +331,14 @@ def report(request):
     # waiting for bigquery).
 
     executor = ThreadPoolExecutor(2)
-    basis_environment_model = EnvironmentModel()
-    sample_environment_model = EnvironmentModel()
-    basis_future = executor.submit(basis_environment_model.read_in_query, basis_query, group_by_param)
-    sample_future = executor.submit(sample_environment_model.read_in_query, sample_query, group_by_param)
+    basis_future = executor.submit(basis_environment_model.read_in_query, basis_query)
+    sample_future = executor.submit(sample_environment_model.read_in_query, sample_query)
     basis_future.result()
     sample_future.result()
-    sample_environment_model.build_mass_assessment_cache(basis_environment_model, alpha=fisher_alpha, regression_when_missing=regression_when_missing)
 
-    ordered_environment_names: List[EnvironmentName] = sorted(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names()))
+    sample_environment_model.build_mass_assessment_cache(basis_environment_model, alpha=fisher_alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)
 
-    context = {
-        'basis_release': basis_release,
-        'basis_start_dt': basis_start_dt,
-        'basis_end_dt': basis_end_dt,
-        'sample_release': sample_release,
-        'sample_start_dt': sample_start_dt,
-        'sample_end_dt': sample_end_dt,
-        'group_by': group_by_param,
-    }
+    ordered_environment_names: List[EnvironmentName] = sorted(set(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names())))
 
     if target_platform_name:
         context['platform'] = target_platform_name
@@ -328,12 +348,20 @@ def report(request):
         context['upgrade'] = target_upgrade_name
     if target_arch_name:
         context['arch'] = target_arch_name
+    if target_variant_name:
+        context['variant'] = target_variant_name
 
     if confidence_param != "95":
         context['confidence'] = confidence_param
 
+    if pity_param != "5":
+        context['pity'] = pity_param
+
     if missing_samples_param != "ok":
         context['missing'] = missing_samples_param
+
+    if include_disruptions:
+        context['disruption'] = include_disruptions_param
 
     def populate_environment_link_context(environment_test_records: EnvironmentTestRecords, link_context: Dict):
         if environment_test_records.platform:
@@ -344,8 +372,10 @@ def report(request):
             link_context['upgrade'] = environment_test_records.upgrade
         if environment_test_records.arch:
             link_context['arch'] = environment_test_records.arch
+        if environment_test_records.variant:
+            link_context['variant'] = environment_test_records.variant
 
-    if target_test_id:  # Rendering a specifically requested TestRecordSet test_id
+    if target_test_id and not target_test_uuid:  # Rendering a specifically requested TestRecordSet test_id
         if not target_environment_name:
             return HttpResponse(f'No environment parameter was specified')
         if not target_component_name:
@@ -371,6 +401,7 @@ def report(request):
                 ('arch', tables.Column()),
                 ('network', tables.Column()),
                 ('upgrade', tables.Column()),
+                ('variant', tables.Column()),
                 ('status', ImageColumn())
             ]
 
@@ -381,6 +412,7 @@ def report(request):
                     'arch': test_record.arch,
                     'network': test_record.network,
                     'upgrade': test_record.upgrade,
+                    'variant': test_record.flat_variants,
                 }
                 href_params = dict(context)
                 href_params.update(env_attributes)
@@ -437,12 +469,15 @@ def report(request):
 
         if not basis_test_record:
             basis_test_record = TestRecord(
+                env_name=sample_test_record.env_name,
                 platform=sample_test_record.platform,
                 network=sample_test_record.network,
                 upgrade=sample_test_record.upgrade,
                 arch=sample_test_record.arch,
+                flat_variants=sample_test_record.flat_variants,
                 test_id=sample_test_record.test_id,
-                test_name=sample_test_record.test_name
+                test_name=sample_test_record.test_name,
+                testsuite=sample_test_record.testsuite,
             )
 
         context['sample_test'] = sample_test_record
@@ -464,6 +499,7 @@ def report(request):
             j.network == sample_test_record.network,
             j.upgrade == sample_test_record.upgrade,
             j.arch == sample_test_record.arch,
+            j.flat_variants == sample_test_record.flat_variants,
             j.test_id == sample_test_record.test_id
         ).group_by(
             j.file_path,
@@ -578,7 +614,7 @@ def report(request):
                 sample_environment_test_records: EnvironmentTestRecords = sample_environment_model.get_environment_test_records(environment_name)
                 sample_component_test_records = sample_environment_test_records.get_component_test_records(component_name)
 
-                component_assessment: TestRecordAssessment = sample_component_test_records.assessment()
+                component_assessment: AggregateTestAssessment = sample_component_test_records.assessment()
 
                 href_params = dict(context)
                 href_params['component'] = component_name

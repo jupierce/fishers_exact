@@ -95,17 +95,18 @@ TestName = str
 
 
 class TestRecordAssessment(Enum):
-    EXTREME_REGRESSION = (-3, 'Regression with >15% pass rate change', 'fire.png')
-    SIGNIFICANT_REGRESSION = (-2, 'Significant regression', 'red.png')
-    MISSING_IN_SAMPLE = (-1, 'No test runs in sample', 'red-question-mark.png')
-    NOT_SIGNIFICANT = (0, 'No significant deviation', 'green.png')
-    MISSING_IN_BASIS = (1, 'No records in basis data', 'green.png')
-    SIGNIFICANT_IMPROVEMENT = (2, 'Significant improvement', 'darkgreen-heart.png')
+    EXTREME_REGRESSION = (-3, 'Regression with >15% pass rate change', 'red-3d.png', 'red-#d.png')
+    SIGNIFICANT_REGRESSION = (-2, 'Significant regression', 'red-3.png', 'red-#.png')
+    MISSING_IN_SAMPLE = (-1, 'No test runs in sample', 'red-question-mark.png', None)
+    NOT_SIGNIFICANT = (0, 'No significant deviation', 'green-3.png', None)
+    MISSING_IN_BASIS = (1, 'Test runs absent in basis data', 'green.png', None)
+    SIGNIFICANT_IMPROVEMENT = (2, 'Significant improvement', 'green-3d.png', None)
 
-    def __init__(self, val: int, description: str, image_path: str):
+    def __init__(self, val: int, description: str, image_path: str, aggregate_image_path_pattern: str):
         self.val = val
         self.description = description
         self.image_path = image_path
+        self.aggregate_image_path_pattern = aggregate_image_path_pattern
 
 
 class AggregateTestAssessment:
@@ -139,7 +140,21 @@ class AggregateTestAssessment:
         self.description = overall_assessment.description
         self.val = overall_assessment.val
         self.image_path = overall_assessment.image_path
+        self.aggregate_image_path_pattern = overall_assessment.aggregate_image_path_pattern
 
+    def image_path_for_underlying_count(self, count) -> str:
+        path = self.aggregate_image_path_pattern
+        if path and '#' in path:
+            # Change the image based on the number of assessments meet the criteria
+            if count == 1:
+                factor = 1
+            elif count < 4:
+                factor = 2
+            else:
+                factor = 3
+            return path.replace('#', str(factor))
+        else:
+            return self.image_path
 
 class TestRecord:
 
@@ -188,10 +203,13 @@ class TestRecord:
     def success_rate_str(self) -> str:
         return '{:.2f}'.format(self.pass_percentage)
 
-    def compute_assessment(self, basis_test_record: "TestRecord", alpha: float, regression_when_missing: bool, pity_factor: float = 0.05):
+    def compute_assessment(self, basis_test_record: "TestRecord", alpha: float, regression_when_missing: bool, pity_factor: float = 0.05, min_fail: int = 3):
         if self.cached_assessment:
             # Already assessed
             return
+        self.cached_assessment = self._compute_assessment(basis_test_record=basis_test_record, alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor, min_fail=min_fail)
+
+    def _compute_assessment(self, basis_test_record: "TestRecord", alpha: float, regression_when_missing: bool, pity_factor: float = 0.05, min_fail: int = 3):
 
         assessment: TestRecordAssessment = TestRecordAssessment.MISSING_IN_BASIS
         if basis_test_record and basis_test_record.total_count_minus_flakes > 0:
@@ -201,6 +219,9 @@ class TestRecord:
                     return TestRecordAssessment.MISSING_IN_SAMPLE
                 else:
                     return TestRecordAssessment.NOT_SIGNIFICANT
+
+            if self.failure_count < min_fail:
+                return TestRecordAssessment.NOT_SIGNIFICANT
 
             basis_pass_percentage = basis_test_record.pass_percentage
             sample_pass_percentage = self.pass_percentage
@@ -239,7 +260,7 @@ class TestRecord:
             else:
                 assessment = TestRecordAssessment.NOT_SIGNIFICANT
 
-        self.cached_assessment = assessment
+        return assessment
 
 
 class TestRecordSet:
@@ -409,7 +430,7 @@ class EnvironmentTestRecords:
     def assessment(self) -> AggregateTestAssessment:
         return TestRecord.aggregate_test_record_assessment([ctr.assessment() for ctr in self.component_test_records.values()])
 
-    def build_mass_assessment_cache(self, basis_environment_test_records: "EnvironmentTestRecords", alpha: float, regression_when_missing: bool, pity_factor: float = 0.05):
+    def build_mass_assessment_cache(self, basis_environment_test_records: "EnvironmentTestRecords", alpha: float, regression_when_missing: bool, pity_factor: float = 0.05, min_fail: int = 3):
 
         basis_test_uuids = set(basis_environment_test_records.all_test_record_uuids)
         sample_test_uuids = set(self.all_test_record_uuids)
@@ -437,7 +458,7 @@ class EnvironmentTestRecords:
         for test_uuid, sample_test_record in self.all_test_records.items():
             basis_test_record = basis_environment_test_records.all_test_records.get(test_uuid, None)
             if basis_test_record:
-                sample_test_record.compute_assessment(basis_test_record, alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)
+                sample_test_record.compute_assessment(basis_test_record, alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor, min_fail=min_fail)
             else:
                 sample_test_record.cached_assessment = TestRecordAssessment.MISSING_IN_BASIS
 
@@ -554,6 +575,8 @@ class EnvironmentModel:
     def read_in_query(self, query):
         bq_client = bigquery.Client(project='openshift-gce-devel')
         raw_query_string = str(query.compile(_junit_table_engine, compile_kwargs={"literal_binds": True}))
+        print()
+        print(raw_query_string)
 
         start_overhead = time.time()
         #df = bq_client.query(raw_query_string).to_dataframe(create_bqstorage_client=False, progress_bar_type='tqdm')
@@ -607,7 +630,7 @@ class EnvironmentModel:
         print(f'Tree building time: {total_time}')
         print(f'Overhead time: {time.time() - start_overhead - total_time}')
 
-    def build_mass_assessment_cache(self, basis_model: "EnvironmentModel", alpha: float = 0.05, regression_when_missing: bool = True, pity_factor: float = 0.05):
+    def build_mass_assessment_cache(self, basis_model: "EnvironmentModel", alpha: float = 0.05, regression_when_missing: bool = True, pity_factor: float = 0.05, min_fail: int = 3):
         # Get a list of all environments - including both basis and sample in case
         # there is one in basis that no longer exists in samples.
         all_names = set(self.get_ordered_environment_names())
@@ -619,4 +642,4 @@ class EnvironmentModel:
 
         for environment_name, env in self.environment_test_records.items():
             basis_model.get_environment_test_records(environment_name, env.reference)   # Make sure the sample environments / components / capabilities exist in basis
-            env.build_mass_assessment_cache(basis_model.environment_test_records[environment_name], alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)
+            env.build_mass_assessment_cache(basis_model.environment_test_records[environment_name], alpha=alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor, min_fail=min_fail)

@@ -91,6 +91,15 @@
                 line-height: 1.6em;
             }
 
+            #min-fail-handle {
+                width: 3em;
+                height: 1.6em;
+                top: 50%;
+                margin-top: -.8em;
+                text-align: center;
+                line-height: 1.6em;
+            }
+
     </style>
 
     <script>
@@ -132,6 +141,11 @@
                 var pity = $("#pity-val").val()
                 if (pity != "5") {
                     optional_params += '&pity=' + pity;
+                }
+
+                var min_fail = $("#min-fail-val").val()
+                if (min_fail != "3") {
+                    optional_params += '&min_fail=' + min_fail;
                 }
 
                 if (!$("#ignore-missing-sample").is(':checked')) {
@@ -294,6 +308,22 @@
                     }
                 });
 
+                var min_fail_handle = $( "#min-fail-handle" );
+                $( "#min-fail-slider" ).slider({
+                    min: 0,
+                    max: 10,
+                    value: 3,
+                    create: function() {
+                        var val = $( this ).slider( "value" );
+                        min_fail_handle.text( val );
+                        $("#min-fail-val").val(""+val);
+                    },
+                    slide: function( event, ui ) {
+                        min_fail_handle.text( ui.value );
+                        $("#min-fail-val").val(""+ui.value);
+                    }
+                });
+
                 $( "#accordion" ).accordion({
                     heightStyle: "content"
                 });
@@ -382,6 +412,9 @@
 
             <label for="ip-libvirt">Libvirt</label>
             <input class="exclude-platform-checkbox" type="checkbox" id="ip-libvirt" value="libvirt">
+
+            <label for="ip-openstack">OpenStak</label>
+            <input class="exclude-platform-checkbox" type="checkbox" id="ip-openstack" value="openstack">
 
             <label for="ip-ovirt">Ovirt</label>
             <input class="exclude-platform-checkbox" type="checkbox" id="ip-ovirt" value="ovirt">
@@ -499,12 +532,18 @@
             <!-- bug in slider when calling for value after another div loads. Store val in hidden field so we can query it here. -->
             <input type="hidden" id="pity-val" value="95" />
 
-            <p>Tests missing in Sample</p>
-            <label for="ignore-missing-sample">Ignore</label>
+            Eads' Ordinal
+            <div id="min-fail-slider" style="margin:5%;">
+                <div id="min-fail-handle" class="ui-slider-handle"></div>
+            </div>
+            <!-- bug in slider when calling for value after another div loads. Store val in hidden field so we can query it here. -->
+            <input type="hidden" id="min-fail-val" value="3" />
+
+            <p>Ignore</p>
+            <label for="ignore-missing-sample">Missing Samples</label>
             <input type="checkbox" checked="checked" id="ignore-missing-sample"/>
 
-            <p>Disruption Tests</p>
-            <label for="ignore-disruption-tests">Ignore</label>
+            <label for="ignore-disruption-tests">Disruption Tests</label>
             <input type="checkbox" checked="checked" id="ignore-disruption-tests"/>
 
         </div>

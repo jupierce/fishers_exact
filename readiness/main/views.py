@@ -40,19 +40,19 @@ class AssessmentImageColumnLink:
         self.image_path = f'main/{assessment.image_path}'
         self.height = 16
         self.width = 16
+        # If this is a failing assessment and it represents multiple underlying assessments
+        # get an image which helps represent the number of underlying failures.
         if assessment.val < 0 and isinstance(assessment, AggregateTestAssessment):
-            if assessment.count == 1:
-                self.width = 8
-                self.height = 8
-            elif assessment.count < 4:
-                self.width = 11
-                self.height = 11
+            self.image_path = f'main/{assessment.image_path_for_underlying_count(assessment.count)}'
         self.href = href
         self.href_params = href_params
         self.title = assessment.description
 
 
 class ImageColumn(tables.Column):
+
+    def __init__(self):
+        super().__init__(attrs={"td": {"class": "img-col"}})
 
     def render(self, value: ImageColumnLink):
         image_path = value.image_path
@@ -167,6 +167,9 @@ def report(request):
 
     pity_param = insufficient_sanitization("pity", "5")
     pity_factor: float = int(pity_param) / 100
+
+    min_fail_param = insufficient_sanitization("min_fail", "3")
+    min_fail: int = int(min_fail_param)
 
     missing_samples_param = insufficient_sanitization("missing", "ok")
     regression_when_missing = missing_samples_param != "ok"
@@ -336,7 +339,7 @@ def report(request):
     basis_future.result()
     sample_future.result()
 
-    sample_environment_model.build_mass_assessment_cache(basis_environment_model, alpha=fisher_alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor)
+    sample_environment_model.build_mass_assessment_cache(basis_environment_model, alpha=fisher_alpha, regression_when_missing=regression_when_missing, pity_factor=pity_factor, min_fail=min_fail)
 
     ordered_environment_names: List[EnvironmentName] = sorted(set(list(sample_environment_model.get_ordered_environment_names()) + list(basis_environment_model.get_ordered_environment_names())))
 
@@ -356,6 +359,9 @@ def report(request):
 
     if pity_param != "5":
         context['pity'] = pity_param
+
+    if min_fail_param != "3":
+        context['min_fail'] = min_fail_param
 
     if missing_samples_param != "ok":
         context['missing'] = missing_samples_param

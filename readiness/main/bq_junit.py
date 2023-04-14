@@ -253,7 +253,7 @@ class TestRecord:
                 if improved:
                     assessment = TestRecordAssessment.SIGNIFICANT_IMPROVEMENT
                 else:
-                    if basis_pass_percentage - sample_pass_percentage > 0.15:
+                    if basis_pass_percentage - sample_pass_percentage > 15:
                         assessment = TestRecordAssessment.EXTREME_REGRESSION
                     else:
                         assessment = TestRecordAssessment.SIGNIFICANT_REGRESSION
